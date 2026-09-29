@@ -48,3 +48,15 @@ To generate the production APK:
 ```
 The compiled, signed release package will be located at:
 `app/build/outputs/apk/release/app-release.apk`
+
+---
+
+## Star History
+
+<a href="https://www.star-history.com/?repos=solo12345689%2Fgenga-world&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=solo12345689/genga-world&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=solo12345689/genga-world&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=solo12345689/genga-world&type=date&legend=top-left" />
+ </picture>
+</a>
