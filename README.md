@@ -60,3 +60,11 @@ The compiled, signed release package will be located at:
    <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=solo12345689/genga-world&type=date&legend=top-left" />
  </picture>
 </a>
+
+---
+
+## 📄 License
+
+This project is licensed under the [MIT License](LICENSE).  
+You are free to use, fork, and modify this project, provided that proper credit and copyright notice to the original creator (**solo12345689**) are included in all copies or substantial portions of the software.
+
