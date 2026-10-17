@@ -27,21 +27,39 @@ class MainActivity : AppCompatActivity() {
         localServer = LocalMovieBoxServer(applicationContext, 3000)
         localServer?.start()
 
+        val imageDispatcher = okhttp3.Dispatcher().apply {
+            maxRequests = 64
+            maxRequestsPerHost = 24
+        }
+
+        // Dedicated high-speed OkHttpClient for image/poster loading with parallel connection pool
+        val imageOkHttpClient = okhttp3.OkHttpClient.Builder()
+            .dispatcher(imageDispatcher)
+            .connectionPool(okhttp3.ConnectionPool(32, 10, java.util.concurrent.TimeUnit.MINUTES))
+            .connectTimeout(5, java.util.concurrent.TimeUnit.SECONDS)
+            .readTimeout(8, java.util.concurrent.TimeUnit.SECONDS)
+            .retryOnConnectionFailure(true)
+            .build()
+
         // Configure high-performance Coil ImageLoader with instant Memory & Disk cache
         val imageLoader = coil.ImageLoader.Builder(applicationContext)
+            .okHttpClient(imageOkHttpClient)
             .memoryCache {
                 coil.memory.MemoryCache.Builder(applicationContext)
-                    .maxSizePercent(0.25) // 25% app memory for instant in-RAM poster caching
+                    .maxSizePercent(0.35) // 35% app memory dedicated to instant poster display
+                    .strongReferencesEnabled(true)
                     .build()
             }
             .diskCache {
                 coil.disk.DiskCache.Builder()
                     .directory(applicationContext.cacheDir.resolve("image_cache"))
-                    .maxSizeBytes(100L * 1024 * 1024) // 100MB persistent fast disk cache
+                    .maxSizeBytes(250L * 1024 * 1024) // 250MB persistent fast disk cache
                     .build()
             }
             .respectCacheHeaders(false) // Cache posters aggressively regardless of remote headers
-            .crossfade(true)
+            .crossfade(false) // Instant 0ms transition for zero display lag
+            .allowHardware(true) // Direct GPU rendering for fastest draw speed
+            .allowRgb565(true) // Reduce memory footprint by 50% for 2x faster bitmap decode
             .build()
         coil.Coil.setImageLoader(imageLoader)
 

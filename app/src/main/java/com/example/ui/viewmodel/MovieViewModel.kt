@@ -128,6 +128,7 @@ class MovieViewModel(application: Application) : AndroidViewModel(application) {
     var downloadedFiles by mutableStateOf<List<java.io.File>>(emptyList())
     var activeDownloads by mutableStateOf<List<ActiveDownload>>(emptyList())
     var isDownloadScanLoaded by mutableStateOf(false)
+    var playingDownloadedFile by mutableStateOf<java.io.File?>(null)
 
     // App In-App Update State
     data class AppUpdateInfo(
@@ -755,8 +756,24 @@ class MovieViewModel(application: Application) : AndroidViewModel(application) {
         prefs.countryCode = if (iso.lowercase() == "in") "91" else "1"
         customMcc = mcc
         customCountryIso = iso
-        loadDashboardContent()
-        loadSearchSuggestions()
+
+        // Clear in-memory caches to force fresh fetch for new region
+        categoryCache.clear()
+        _trendingMovies.value = emptyList()
+        _categoryMovies.value = emptyList()
+
+        // Invalidate local proxy cache and guest token for the new region
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val client = okhttp3.OkHttpClient.Builder().connectTimeout(2, java.util.concurrent.TimeUnit.SECONDS).build()
+                val req = okhttp3.Request.Builder().url("http://127.0.0.1:3000/clear-cache").build()
+                client.newCall(req).execute().close()
+            } catch (_: Exception) {}
+            withContext(Dispatchers.Main) {
+                loadDashboardContent()
+                loadSearchSuggestions()
+            }
+        }
     }
 
     fun resetSandbox() {
@@ -782,25 +799,31 @@ class MovieViewModel(application: Application) : AndroidViewModel(application) {
                 _categoryMovies.value = categories
                 
                 // Pre-fetch details and warm up poster image cache for instant rendering
-                trending.take(12).forEach { item ->
+                val app = getApplication<Application>()
+                val imgLoader = coil.Coil.imageLoader(app)
+                trending.take(20).forEach { item ->
                     launch { repository.getDetail(item.id) }
                     if (item.poster.isNotEmpty()) {
-                        launch {
-                            val request = coil.request.ImageRequest.Builder(getApplication<Application>())
+                        launch(Dispatchers.IO) {
+                            val request = coil.request.ImageRequest.Builder(app)
                                 .data(item.poster)
+                                .memoryCacheKey(item.poster)
+                                .diskCacheKey(item.poster)
                                 .build()
-                            coil.Coil.imageLoader(getApplication<Application>()).enqueue(request)
+                            imgLoader.enqueue(request)
                         }
                     }
                 }
-                categories.take(15).forEach { item ->
+                categories.take(24).forEach { item ->
                     launch { repository.getDetail(item.id) }
                     if (item.poster.isNotEmpty()) {
-                        launch {
-                            val request = coil.request.ImageRequest.Builder(getApplication<Application>())
+                        launch(Dispatchers.IO) {
+                            val request = coil.request.ImageRequest.Builder(app)
                                 .data(item.poster)
+                                .memoryCacheKey(item.poster)
+                                .diskCacheKey(item.poster)
                                 .build()
-                            coil.Coil.imageLoader(getApplication<Application>()).enqueue(request)
+                            imgLoader.enqueue(request)
                         }
                     }
                 }
@@ -848,14 +871,18 @@ class MovieViewModel(application: Application) : AndroidViewModel(application) {
                 categoryCache[categoryId] = categories
                 _categoryMovies.value = categories
                 // Pre-fetch details and warm up posters in the background
-                categories.take(15).forEach { item ->
+                val app = getApplication<Application>()
+                val imgLoader = coil.Coil.imageLoader(app)
+                categories.take(24).forEach { item ->
                     launch { repository.getDetail(item.id) }
                     if (item.poster.isNotEmpty()) {
-                        launch {
-                            val request = coil.request.ImageRequest.Builder(getApplication<Application>())
+                        launch(Dispatchers.IO) {
+                            val request = coil.request.ImageRequest.Builder(app)
                                 .data(item.poster)
+                                .memoryCacheKey(item.poster)
+                                .diskCacheKey(item.poster)
                                 .build()
-                            coil.Coil.imageLoader(getApplication<Application>()).enqueue(request)
+                            imgLoader.enqueue(request)
                         }
                     }
                 }

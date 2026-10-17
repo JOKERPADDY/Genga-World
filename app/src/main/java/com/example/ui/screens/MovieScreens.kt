@@ -28,6 +28,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.scale
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.graphics.Brush
@@ -70,6 +71,8 @@ import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import android.widget.Toast
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.foundation.gestures.detectTapGestures
 
 
 fun downloadVideo(context: android.content.Context, url: String, title: String, posterUrl: String = "") {
@@ -141,13 +144,167 @@ fun downloadVideo(context: android.content.Context, url: String, title: String, 
     }
 }
 
+object VideoCacheManager {
+    @Volatile
+    private var simpleCache: androidx.media3.datasource.cache.SimpleCache? = null
+
+    @Synchronized
+    fun getCache(context: android.content.Context): androidx.media3.datasource.cache.SimpleCache {
+        if (simpleCache == null) {
+            val cacheDir = java.io.File(context.cacheDir, "media_video_cache")
+            val evictor = androidx.media3.datasource.cache.LeastRecentlyUsedCacheEvictor(300L * 1024 * 1024) // 300MB fast LRU disk cache
+            val databaseProvider = androidx.media3.database.StandaloneDatabaseProvider(context)
+            simpleCache = androidx.media3.datasource.cache.SimpleCache(cacheDir, evictor, databaseProvider)
+        }
+        return simpleCache!!
+    }
+}
+
+@Composable
+fun SplashScreen(
+    isReady: Boolean,
+    onFinish: () -> Unit
+) {
+    var startAnimation by remember { mutableStateOf(false) }
+    val alphaAnim by androidx.compose.animation.core.animateFloatAsState(
+        targetValue = if (startAnimation) 1f else 0f,
+        animationSpec = androidx.compose.animation.core.tween(durationMillis = 600),
+        label = "splash_fade_in"
+    )
+    val scaleAnim by androidx.compose.animation.core.animateFloatAsState(
+        targetValue = if (startAnimation) 1f else 0.85f,
+        animationSpec = androidx.compose.animation.core.tween(
+            durationMillis = 700,
+            easing = androidx.compose.animation.core.FastOutSlowInEasing
+        ),
+        label = "splash_scale"
+    )
+
+    LaunchedEffect(Unit) {
+        startAnimation = true
+    }
+
+    LaunchedEffect(isReady) {
+        val startTime = System.currentTimeMillis()
+        val minDisplayTimeMs = 850L
+        val maxWaitTimeMs = 2000L // Safety timeout: never trap or freeze the user
+
+        while (isActive) {
+            val elapsed = System.currentTimeMillis() - startTime
+            if (isReady && elapsed >= minDisplayTimeMs) {
+                onFinish()
+                break
+            }
+            if (elapsed >= maxWaitTimeMs) {
+                // Timeout safety exit: proceed to Home screen even if network is slow
+                onFinish()
+                break
+            }
+            delay(50L)
+        }
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(
+                Brush.verticalGradient(
+                    colors = listOf(
+                        Color(0xFF140204),
+                        ObsidianDark,
+                        Color(0xFF07080D)
+                    )
+                )
+            ),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center,
+            modifier = Modifier
+                .alpha(alphaAnim)
+                .scale(scaleAnim)
+        ) {
+            // App Icon in clean circular frame
+            Box(
+                contentAlignment = Alignment.Center,
+                modifier = Modifier
+                    .size(96.dp)
+                    .clip(CircleShape)
+                    .background(ObsidianCard)
+            ) {
+                androidx.compose.foundation.Image(
+                    painter = painterResource(id = R.drawable.ic_launcher_fg),
+                    contentDescription = "Genga World Logo",
+                    modifier = Modifier.size(80.dp)
+                )
+            }
+
+            Spacer(modifier = Modifier.height(20.dp))
+
+            // Cinematic App Title
+            Text(
+                text = "GENGA WORLD",
+                fontSize = 24.sp,
+                fontWeight = FontWeight.ExtraBold,
+                letterSpacing = 3.sp,
+                color = TextPrimary
+            )
+
+            Spacer(modifier = Modifier.height(6.dp))
+
+            Text(
+                text = "Stream Endless Cinema",
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Normal,
+                letterSpacing = 1.5.sp,
+                color = TextSecondary
+            )
+
+            Spacer(modifier = Modifier.height(32.dp))
+
+            // Smooth sleek loading bar
+            CircularProgressIndicator(
+                modifier = Modifier.size(24.dp),
+                color = CinematicRed,
+                strokeWidth = 2.dp
+            )
+        }
+    }
+}
+
+@OptIn(ExperimentalAnimationApi::class)
 @Composable
 fun MovieBoxApp(viewModel: MovieViewModel) {
+    val trending by viewModel.trendingMovies.collectAsState()
+    val categoryMovies by viewModel.categoryMovies.collectAsState()
+    val isContentReady = remember(trending, categoryMovies, viewModel.isDashboardLoading) {
+        (trending.isNotEmpty() || categoryMovies.isNotEmpty()) && !viewModel.isDashboardLoading
+    }
+
+    var showSplash by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf(true) }
+
     Surface(
         modifier = Modifier.fillMaxSize(),
         color = MaterialTheme.colorScheme.background
     ) {
-        MainContent(viewModel)
+        AnimatedContent(
+            targetState = showSplash,
+            transitionSpec = {
+                fadeIn(animationSpec = tween(400)) with
+                fadeOut(animationSpec = tween(400))
+            },
+            label = "splash_to_main_transition"
+        ) { isSplashVisible ->
+            if (isSplashVisible) {
+                SplashScreen(
+                    isReady = isContentReady,
+                    onFinish = { showSplash = false }
+                )
+            } else {
+                MainContent(viewModel)
+            }
+        }
     }
 }
 
@@ -750,7 +907,7 @@ fun MainContent(viewModel: MovieViewModel) {
     Box(modifier = Modifier.fillMaxSize()) {
         Scaffold(
             bottomBar = {
-                if (viewModel.playInfo == null) {
+                if (viewModel.playInfo == null && viewModel.playingDownloadedFile == null) {
                     NavigationBar(
                         containerColor = ObsidianDark,
                         tonalElevation = 8.dp
@@ -877,6 +1034,21 @@ fun MainContent(viewModel: MovieViewModel) {
             exit = fadeOut(animationSpec = tween(250))
         ) {
             PlayerScreen(viewModel)
+        }
+
+        // Offline Download Video Player overlay
+        AnimatedVisibility(
+            visible = viewModel.playingDownloadedFile != null,
+            enter = fadeIn(animationSpec = tween(250)),
+            exit = fadeOut(animationSpec = tween(250))
+        ) {
+            val file = viewModel.playingDownloadedFile
+            if (file != null) {
+                OfflinePlayerScreen(
+                    fileToPlay = file,
+                    onDismiss = { viewModel.playingDownloadedFile = null }
+                )
+            }
         }
 
         // Playback loading overlay
@@ -1147,6 +1319,25 @@ fun HomeScreen(viewModel: MovieViewModel) {
     val trending by viewModel.trendingMovies.collectAsState()
     val categoryMovies by viewModel.categoryMovies.collectAsState()
 
+    val context = LocalContext.current
+    val imageLoader = remember(context) { coil.Coil.imageLoader(context) }
+
+    // Prioritize and immediately start loading top hero banner and top row images first
+    LaunchedEffect(categoryMovies, trending) {
+        val topBannerPosters = categoryMovies.take(3).mapNotNull { it.poster.takeIf { p -> p.isNotBlank() } }
+        val topTrendingPosters = trending.take(6).mapNotNull { it.poster.takeIf { p -> p.isNotBlank() } }
+        val priorityPosters = (topBannerPosters + topTrendingPosters).distinct()
+
+        for (url in priorityPosters) {
+            val req = coil.request.ImageRequest.Builder(context)
+                .data(url)
+                .memoryCacheKey(url)
+                .diskCacheKey(url)
+                .build()
+            imageLoader.enqueue(req)
+        }
+    }
+
     if (viewModel.isDashboardLoading) {
         DashboardShimmerScreen()
     } else {
@@ -1188,7 +1379,9 @@ fun HomeScreen(viewModel: MovieViewModel) {
                             AsyncImage(
                                 model = coil.request.ImageRequest.Builder(LocalContext.current)
                                     .data(heroMovie.poster)
-                                    .crossfade(150)
+                                    .memoryCacheKey(heroMovie.poster)
+                                    .diskCacheKey(heroMovie.poster)
+                                    .crossfade(false)
                                     .build(),
                                 contentDescription = heroMovie.name,
                                 contentScale = ContentScale.Crop,
@@ -1359,7 +1552,9 @@ fun MovieGridItem(movie: MovieSubject, showRating: Boolean = false, onClick: () 
             AsyncImage(
                 model = coil.request.ImageRequest.Builder(LocalContext.current)
                     .data(movie.poster)
-                    .crossfade(150)
+                    .memoryCacheKey(movie.poster)
+                    .diskCacheKey(movie.poster)
+                    .crossfade(false)
                     .build(),
                 contentDescription = movie.name,
                 contentScale = ContentScale.Crop,
@@ -2307,6 +2502,11 @@ fun PlayerScreen(viewModel: MovieViewModel) {
     val playerHeight = minOf(screenWidth * (9f / 16f), screenHeight * 0.32f)
     var isControllerVisible by remember { mutableStateOf(true) }
 
+    // Double-tap Gesture Indicator States
+    var doubleTapActionText by remember { mutableStateOf<String?>(null) }
+    var doubleTapActionSide by remember { mutableStateOf<String?>(null) } // "left", "center", "right"
+    var gestureAnimTrigger by remember { mutableStateOf(0L) }
+
     // Initialize Media3 ExoPlayer
     val exoPlayer = remember {
         val audioAttributes = androidx.media3.common.AudioAttributes.Builder()
@@ -2349,10 +2549,10 @@ fun PlayerScreen(viewModel: MovieViewModel) {
         val loadControl = androidx.media3.exoplayer.DefaultLoadControl.Builder()
             .setAllocator(allocator)
             .setBufferDurationsMs(
-                60000,   // minBufferMs (60 seconds minimum buffer before network idles)
-                300000,  // maxBufferMs (5 minutes of forward buffer)
-                5000,    // bufferForPlaybackMs (Wait for 5 seconds of video before starting)
-                10000    // bufferForPlaybackAfterRebufferMs (Wait for 10s if it stutters)
+                25000,   // minBufferMs (25 seconds minimum buffer before idle)
+                120000,  // maxBufferMs (2 minutes max buffer limit)
+                1000,    // bufferForPlaybackMs (Only 1.0 second needed to start instantly!)
+                2000     // bufferForPlaybackAfterRebufferMs (Only 2.0 seconds needed to recover)
             )
             .setTargetBufferBytes(targetBufferBytes) // Dynamically calculated safe limit
             .setPrioritizeTimeOverSizeThresholds(true)
@@ -2397,13 +2597,19 @@ fun PlayerScreen(viewModel: MovieViewModel) {
     // Update stream and subtitle configuration
     LaunchedEffect(streamUrl, subtitleUrl) {
         if (streamUrl.isNotEmpty()) {
-            val dataSourceFactory = androidx.media3.datasource.DefaultHttpDataSource.Factory()
+            val httpDataSourceFactory = androidx.media3.datasource.DefaultHttpDataSource.Factory()
                 .setUserAgent("MovieBoxPro/16.2.1 (Android 14; com.community.mbox.in)")
                 .setAllowCrossProtocolRedirects(true)
             
             if (selectedCookie.isNotEmpty()) {
-                dataSourceFactory.setDefaultRequestProperties(mapOf("Cookie" to selectedCookie))
+                httpDataSourceFactory.setDefaultRequestProperties(mapOf("Cookie" to selectedCookie))
             }
+
+            // Wrap with on-disk LRU media cache for zero-stutter seeks and zero repeated downloads
+            val cacheDataSourceFactory = androidx.media3.datasource.cache.CacheDataSource.Factory()
+                .setCache(VideoCacheManager.getCache(context))
+                .setUpstreamDataSourceFactory(httpDataSourceFactory)
+                .setFlags(androidx.media3.datasource.cache.CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
 
             val mediaItemBuilder = MediaItem.Builder().setUri(Uri.parse(streamUrl))
             if (!subtitleUrl.isNullOrEmpty()) {
@@ -2421,7 +2627,7 @@ fun PlayerScreen(viewModel: MovieViewModel) {
             }
 
             val mediaSourceFactory = androidx.media3.exoplayer.source.DefaultMediaSourceFactory(
-                dataSourceFactory,
+                cacheDataSourceFactory,
                 androidx.media3.extractor.DefaultExtractorsFactory()
             )
             val mediaSource = mediaSourceFactory.createMediaSource(mediaItemBuilder.build())
@@ -2606,16 +2812,169 @@ fun PlayerScreen(viewModel: MovieViewModel) {
                     modifier = Modifier.fillMaxSize()
                 )
 
-                // Click gesture overlay catcher when controllers are hidden
-                if (!isControllerVisible) {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .clickable(
-                                indication = null,
-                                interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }
-                            ) { isControllerVisible = true }
-                    )
+                // Universal Gestures Layer (Single tap toggles UI, Double tap Left = -5s, Center = Pause/Play, Right = +10s)
+                val density = androidx.compose.ui.platform.LocalDensity.current
+                val coroutineScope = rememberCoroutineScope()
+
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .pointerInput(Unit) {
+                            detectTapGestures(
+                                onTap = {
+                                    isControllerVisible = !isControllerVisible
+                                },
+                                onDoubleTap = { tapOffset: androidx.compose.ui.geometry.Offset ->
+                                    val width = size.width.toFloat()
+                                    val x = tapOffset.x
+                                    val leftBoundary = width * 0.35f
+                                    val rightBoundary = width * 0.65f
+
+                                    when {
+                                        x < leftBoundary -> {
+                                            // Left side: rewind 5 seconds
+                                            val current = exoPlayer.currentPosition
+                                            val target = (current - 5000L).coerceAtLeast(0L)
+                                            exoPlayer.seekTo(target)
+                                            doubleTapActionSide = "left"
+                                            doubleTapActionText = "-5s"
+                                            gestureAnimTrigger = System.currentTimeMillis()
+                                        }
+                                        x > rightBoundary -> {
+                                            // Right side: forward 10 seconds
+                                            val current = exoPlayer.currentPosition
+                                            val dur = exoPlayer.duration
+                                            val target = if (dur > 0) (current + 10000L).coerceAtMost(dur) else current + 10000L
+                                            exoPlayer.seekTo(target)
+                                            doubleTapActionSide = "right"
+                                            doubleTapActionText = "+10s"
+                                            gestureAnimTrigger = System.currentTimeMillis()
+                                        }
+                                        else -> {
+                                            // Center: toggle play / pause (stop video)
+                                            if (exoPlayer.isPlaying) {
+                                                exoPlayer.pause()
+                                                viewModel.isPlaying = false
+                                                doubleTapActionSide = "center"
+                                                doubleTapActionText = "PAUSE"
+                                            } else {
+                                                exoPlayer.play()
+                                                viewModel.isPlaying = true
+                                                doubleTapActionSide = "center"
+                                                doubleTapActionText = "PLAY"
+                                            }
+                                            gestureAnimTrigger = System.currentTimeMillis()
+                                        }
+                                    }
+                                }
+                            )
+                        }
+                )
+
+                // Double-Tap Animated Feedback Badges
+                LaunchedEffect(gestureAnimTrigger) {
+                    if (gestureAnimTrigger > 0L) {
+                        delay(750)
+                        doubleTapActionSide = null
+                        doubleTapActionText = null
+                    }
+                }
+
+                androidx.compose.animation.AnimatedVisibility(
+                    visible = doubleTapActionSide != null,
+                    enter = fadeIn(tween(150)) + scaleIn(tween(150)),
+                    exit = fadeOut(tween(250)),
+                    modifier = Modifier.fillMaxSize()
+                ) {
+                    Box(modifier = Modifier.fillMaxSize()) {
+                        when (doubleTapActionSide) {
+                            "left" -> {
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxHeight()
+                                        .fillMaxWidth(0.38f)
+                                        .align(Alignment.CenterStart)
+                                        .background(
+                                            Brush.horizontalGradient(
+                                                listOf(Color.White.copy(alpha = 0.22f), Color.Transparent)
+                                            )
+                                        ),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                        Icon(
+                                            Icons.Filled.Replay5,
+                                            contentDescription = "Rewind 5s",
+                                            tint = Color.White,
+                                            modifier = Modifier.size(46.dp)
+                                        )
+                                        Spacer(modifier = Modifier.height(4.dp))
+                                        Text(
+                                            text = doubleTapActionText ?: "-5s",
+                                            color = Color.White,
+                                            fontSize = 14.sp,
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                    }
+                                }
+                            }
+                            "right" -> {
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxHeight()
+                                        .fillMaxWidth(0.38f)
+                                        .align(Alignment.CenterEnd)
+                                        .background(
+                                            Brush.horizontalGradient(
+                                                listOf(Color.Transparent, Color.White.copy(alpha = 0.22f))
+                                            )
+                                        ),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                        Icon(
+                                            Icons.Filled.Forward10,
+                                            contentDescription = "Forward 10s",
+                                            tint = Color.White,
+                                            modifier = Modifier.size(46.dp)
+                                        )
+                                        Spacer(modifier = Modifier.height(4.dp))
+                                        Text(
+                                            text = doubleTapActionText ?: "+10s",
+                                            color = Color.White,
+                                            fontSize = 14.sp,
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                    }
+                                }
+                            }
+                            "center" -> {
+                                Box(
+                                    modifier = Modifier
+                                        .size(80.dp)
+                                        .align(Alignment.Center)
+                                        .background(Color.Black.copy(alpha = 0.65f), shape = RoundedCornerShape(20.dp)),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                        Icon(
+                                            if (viewModel.isPlaying) Icons.Filled.PlayArrow else Icons.Filled.Pause,
+                                            contentDescription = "Play/Pause Toggle",
+                                            tint = Color.White,
+                                            modifier = Modifier.size(40.dp)
+                                        )
+                                        Text(
+                                            text = doubleTapActionText ?: "",
+                                            color = Color.White,
+                                            fontSize = 11.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            letterSpacing = 1.sp
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
 
                 // Custom Compose Playback Controller Overlay
@@ -2625,14 +2984,7 @@ fun PlayerScreen(viewModel: MovieViewModel) {
                     exit = fadeOut(),
                     modifier = Modifier.fillMaxSize()
                 ) {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .clickable(
-                                indication = null,
-                                interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }
-                            ) { isControllerVisible = false }
-                    ) {
+                    Box(modifier = Modifier.fillMaxSize()) {
                         // Top Bar: Back button on the left, Settings gear on the right
                         Row(
                             modifier = Modifier
@@ -3599,7 +3951,6 @@ fun DownloadScreen(viewModel: MovieViewModel) {
     val activeDownloads = viewModel.activeDownloads
     val isScanLoaded = viewModel.isDownloadScanLoaded
     var expandedShows by remember { mutableStateOf(setOf<String>()) }
-    var playingFile by remember { mutableStateOf<java.io.File?>(null) }
     var playerPickerFile by remember { mutableStateOf<java.io.File?>(null) }
 
     LaunchedEffect(hasPermission) {
@@ -3992,7 +4343,7 @@ fun DownloadScreen(viewModel: MovieViewModel) {
                             .clip(RoundedCornerShape(12.dp))
                             .background(ObsidianDark)
                             .clickable {
-                                playingFile = fileToPlay
+                                viewModel.playingDownloadedFile = fileToPlay
                                 playerPickerFile = null
                             }
                             .padding(12.dp),
@@ -4150,34 +4501,427 @@ fun DownloadScreen(viewModel: MovieViewModel) {
             }
         }
         
-        if (playingFile != null) {
-            val exoPlayer = remember {
-                androidx.media3.exoplayer.ExoPlayer.Builder(context).build().apply {
-                    setMediaItem(androidx.media3.common.MediaItem.fromUri(android.net.Uri.fromFile(playingFile!!)))
-                    prepare()
-                    playWhenReady = true
-                }
+    }
+}
+
+@Composable
+fun OfflinePlayerScreen(fileToPlay: java.io.File, onDismiss: () -> Unit) {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val epMatch = Regex("_S(\\d+)E(\\d+)").find(fileToPlay.nameWithoutExtension)
+    val displayTitle = if (epMatch != null) {
+        val showPrefix = fileToPlay.nameWithoutExtension.substringBefore("_S").replace("_", " ")
+        "$showPrefix - S${epMatch.groupValues[1]} E${epMatch.groupValues[2]}"
+    } else {
+        fileToPlay.nameWithoutExtension.replace("_", " ")
+    }
+
+    var isOfflineControllerVisible by remember { mutableStateOf(true) }
+    var isOfflinePlaying by remember { mutableStateOf(true) }
+    var currentOfflineProgressMs by remember { mutableStateOf(0L) }
+    var offlineDurationMs by remember { mutableStateOf(0L) }
+    var isOfflineBuffering by remember { mutableStateOf(false) }
+
+    // Double-Tap Gesture Indicator States
+    var offlineDoubleTapSide by remember { mutableStateOf<String?>(null) }
+    var offlineDoubleTapText by remember { mutableStateOf<String?>(null) }
+    var offlineGestureTrigger by remember { mutableStateOf(0L) }
+
+    val offlineConfiguration = androidx.compose.ui.platform.LocalConfiguration.current
+    val isOfflineFullscreen = offlineConfiguration.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE
+    val offlineActivity = context as? android.app.Activity
+    val isOfflineInPip = offlineActivity?.isInPictureInPictureMode ?: false
+
+    val exoPlayer = remember(fileToPlay) {
+        androidx.media3.exoplayer.ExoPlayer.Builder(context).build().apply {
+            setMediaItem(androidx.media3.common.MediaItem.fromUri(android.net.Uri.fromFile(fileToPlay)))
+            prepare()
+            playWhenReady = true
+        }
+    }
+
+    DisposableEffect(fileToPlay) {
+        val listener = object : androidx.media3.common.Player.Listener {
+            override fun onPlaybackStateChanged(state: Int) {
+                isOfflineBuffering = (state == androidx.media3.common.Player.STATE_BUFFERING)
             }
-            DisposableEffect(playingFile) {
-                onDispose {
-                    exoPlayer.release()
-                }
+            override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
+                isOfflinePlaying = playWhenReady
             }
-            Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
-                androidx.compose.ui.viewinterop.AndroidView(
-                    factory = {
-                        androidx.media3.ui.PlayerView(context).apply {
-                            player = exoPlayer
-                            useController = true
-                        }
-                    },
-                    modifier = Modifier.fillMaxSize()
+        }
+        exoPlayer.addListener(listener)
+        onDispose {
+            exoPlayer.removeListener(listener)
+            exoPlayer.release()
+            offlineActivity?.requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+            offlineActivity?.window?.decorView?.systemUiVisibility = android.view.View.SYSTEM_UI_FLAG_VISIBLE
+        }
+    }
+
+    // Keep system bars hidden when in landscape fullscreen
+    LaunchedEffect(isOfflineFullscreen) {
+        if (offlineActivity != null) {
+            if (isOfflineFullscreen) {
+                offlineActivity.window.decorView.systemUiVisibility = (
+                    android.view.View.SYSTEM_UI_FLAG_FULLSCREEN
+                    or android.view.View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                    or android.view.View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
                 )
-                IconButton(
-                    onClick = { playingFile = null },
-                    modifier = Modifier.align(Alignment.TopStart).padding(top = 32.dp, start = 16.dp)
+            } else {
+                offlineActivity.window.decorView.systemUiVisibility = android.view.View.SYSTEM_UI_FLAG_VISIBLE
+            }
+        }
+    }
+
+    // Progress ticker
+    LaunchedEffect(isOfflinePlaying) {
+        if (isOfflinePlaying) {
+            while (true) {
+                val pos = exoPlayer.currentPosition
+                val dur = exoPlayer.duration
+                if (dur > 0) {
+                    currentOfflineProgressMs = pos
+                    offlineDurationMs = dur
+                }
+                delay(1000)
+            }
+        }
+    }
+
+    // Auto-hide controller
+    LaunchedEffect(isOfflineControllerVisible, isOfflinePlaying) {
+        if (isOfflineControllerVisible && isOfflinePlaying) {
+            delay(4000)
+            isOfflineControllerVisible = false
+        }
+    }
+
+    // Reset gesture animation
+    LaunchedEffect(offlineGestureTrigger) {
+        if (offlineGestureTrigger > 0L) {
+            delay(750)
+            offlineDoubleTapSide = null
+            offlineDoubleTapText = null
+        }
+    }
+
+    Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
+        androidx.compose.ui.viewinterop.AndroidView(
+            factory = { ctx ->
+                val view = android.view.LayoutInflater.from(ctx).inflate(com.example.R.layout.texture_player_view, null) as androidx.media3.ui.PlayerView
+                view.keepScreenOn = true
+                view.isHapticFeedbackEnabled = false
+                view.isSoundEffectsEnabled = false
+                view.useController = false
+                view.apply {
+                    subtitleView?.setViewType(androidx.media3.ui.SubtitleView.VIEW_TYPE_CANVAS)
+                    val cleanStyle = androidx.media3.ui.CaptionStyleCompat(
+                        android.graphics.Color.WHITE,
+                        android.graphics.Color.TRANSPARENT,
+                        android.graphics.Color.TRANSPARENT,
+                        androidx.media3.ui.CaptionStyleCompat.EDGE_TYPE_OUTLINE,
+                        android.graphics.Color.BLACK,
+                        null
+                    )
+                    subtitleView?.setStyle(cleanStyle)
+                    player = exoPlayer
+                }
+            },
+            modifier = Modifier.fillMaxSize()
+        )
+
+        // Universal Gestures Layer (Single tap toggles UI, Double tap Left = -5s, Center = Pause/Play, Right = +10s)
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .pointerInput(Unit) {
+                    detectTapGestures(
+                        onTap = {
+                            isOfflineControllerVisible = !isOfflineControllerVisible
+                        },
+                        onDoubleTap = { tapOffset: androidx.compose.ui.geometry.Offset ->
+                            val width = size.width.toFloat()
+                            val x = tapOffset.x
+                            val leftBoundary = width * 0.35f
+                            val rightBoundary = width * 0.65f
+
+                            when {
+                                x < leftBoundary -> {
+                                    // Left: rewind 5s
+                                    val current = exoPlayer.currentPosition
+                                    val target = (current - 5000L).coerceAtLeast(0L)
+                                    exoPlayer.seekTo(target)
+                                    offlineDoubleTapSide = "left"
+                                    offlineDoubleTapText = "-5s"
+                                    offlineGestureTrigger = System.currentTimeMillis()
+                                }
+                                x > rightBoundary -> {
+                                    // Right: forward 10s
+                                    val current = exoPlayer.currentPosition
+                                    val dur = exoPlayer.duration
+                                    val target = if (dur > 0) (current + 10000L).coerceAtMost(dur) else current + 10000L
+                                    exoPlayer.seekTo(target)
+                                    offlineDoubleTapSide = "right"
+                                    offlineDoubleTapText = "+10s"
+                                    offlineGestureTrigger = System.currentTimeMillis()
+                                }
+                                else -> {
+                                    // Center: toggle play / pause
+                                    if (exoPlayer.isPlaying) {
+                                        exoPlayer.pause()
+                                        isOfflinePlaying = false
+                                        offlineDoubleTapSide = "center"
+                                        offlineDoubleTapText = "PAUSE"
+                                    } else {
+                                        exoPlayer.play()
+                                        isOfflinePlaying = true
+                                        offlineDoubleTapSide = "center"
+                                        offlineDoubleTapText = "PLAY"
+                                    }
+                                    offlineGestureTrigger = System.currentTimeMillis()
+                                }
+                            }
+                        }
+                    )
+                }
+        )
+
+        // Double-Tap Animated Feedback Badges
+        androidx.compose.animation.AnimatedVisibility(
+            visible = offlineDoubleTapSide != null,
+            enter = fadeIn(tween(150)) + scaleIn(tween(150)),
+            exit = fadeOut(tween(250)),
+            modifier = Modifier.fillMaxSize()
+        ) {
+            Box(modifier = Modifier.fillMaxSize()) {
+                when (offlineDoubleTapSide) {
+                    "left" -> {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxHeight()
+                                .fillMaxWidth(0.38f)
+                                .align(Alignment.CenterStart)
+                            .background(
+                                Brush.horizontalGradient(
+                                    listOf(Color.White.copy(alpha = 0.22f), Color.Transparent)
+                                )
+                            ),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                Icon(Icons.Filled.Replay5, contentDescription = "Rewind 5s", tint = Color.White, modifier = Modifier.size(46.dp))
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Text(text = offlineDoubleTapText ?: "-5s", color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                            }
+                        }
+                    }
+                    "right" -> {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxHeight()
+                                .fillMaxWidth(0.38f)
+                                .align(Alignment.CenterEnd)
+                            .background(
+                                Brush.horizontalGradient(
+                                    listOf(Color.Transparent, Color.White.copy(alpha = 0.22f))
+                                )
+                            ),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                Icon(Icons.Filled.Forward10, contentDescription = "Forward 10s", tint = Color.White, modifier = Modifier.size(46.dp))
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Text(text = offlineDoubleTapText ?: "+10s", color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                            }
+                        }
+                    }
+                    "center" -> {
+                        Box(
+                            modifier = Modifier
+                                .size(80.dp)
+                                .align(Alignment.Center)
+                                .background(Color.Black.copy(alpha = 0.65f), shape = RoundedCornerShape(20.dp)),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                Icon(
+                                    if (isOfflinePlaying) Icons.Filled.PlayArrow else Icons.Filled.Pause,
+                                    contentDescription = "Play/Pause",
+                                    tint = Color.White,
+                                    modifier = Modifier.size(40.dp)
+                                )
+                                Text(
+                                    text = offlineDoubleTapText ?: "",
+                                    color = Color.White,
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    letterSpacing = 1.sp
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Custom Playback Controller Overlay (matching normal player without settings & download)
+        androidx.compose.animation.AnimatedVisibility(
+            visible = isOfflineControllerVisible && !isOfflineInPip,
+            enter = fadeIn(),
+            exit = fadeOut(),
+            modifier = Modifier.fillMaxSize()
+        ) {
+            Box(modifier = Modifier.fillMaxSize()) {
+                // Top Bar: Back button on the left, Title in center
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .align(Alignment.TopStart)
+                        .background(
+                            Brush.verticalGradient(
+                                colors = listOf(Color.Black.copy(alpha = 0.6f), Color.Transparent)
+                            )
+                        )
+                        .statusBarsPadding()
+                        .clickable(enabled = false) {}
+                        .padding(horizontal = 8.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Icon(Icons.Filled.ArrowBack, contentDescription = "Close", tint = Color.White)
+                    IconButton(onClick = {
+                        offlineActivity?.requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+                        offlineActivity?.window?.decorView?.systemUiVisibility = android.view.View.SYSTEM_UI_FLAG_VISIBLE
+                        onDismiss()
+                    }) {
+                        Icon(Icons.Filled.ArrowBack, contentDescription = "Close Player", tint = Color.White)
+                    }
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = displayTitle,
+                        color = Color.White,
+                        fontSize = 15.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+
+                // Center Buffering Spinner
+                if (isOfflineBuffering) {
+                    CircularProgressIndicator(
+                        color = CinematicRed,
+                        modifier = Modifier.align(Alignment.Center).size(48.dp)
+                    )
+                }
+
+                // Bottom Controls Row: Play/Pause, Seekbar, Duration, PIP, Fullscreen
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .align(Alignment.BottomStart)
+                        .background(
+                            Brush.verticalGradient(
+                                colors = listOf(Color.Transparent, Color.Black.copy(alpha = 0.65f))
+                            )
+                        )
+                        .navigationBarsPadding()
+                        .clickable(enabled = false) {}
+                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    // Play/Pause Button
+                    IconButton(
+                        onClick = {
+                            if (exoPlayer.isPlaying) {
+                                exoPlayer.pause()
+                                isOfflinePlaying = false
+                            } else {
+                                exoPlayer.play()
+                                isOfflinePlaying = true
+                            }
+                        },
+                        modifier = Modifier.size(32.dp)
+                    ) {
+                        Icon(
+                            if (isOfflinePlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
+                            contentDescription = "Play/Pause",
+                            tint = Color.White,
+                            modifier = Modifier.size(24.dp)
+                        )
+                    }
+
+                    // Progress Slider
+                    Slider(
+                        value = currentOfflineProgressMs.toFloat(),
+                        onValueChange = { currentOfflineProgressMs = it.toLong() },
+                        onValueChangeFinished = { exoPlayer.seekTo(currentOfflineProgressMs) },
+                        valueRange = 0f..maxOf(1f, offlineDurationMs.toFloat()),
+                        colors = SliderDefaults.colors(
+                            thumbColor = Color.White,
+                            activeTrackColor = Color.White,
+                            inactiveTrackColor = Color.Gray.copy(alpha = 0.4f)
+                        ),
+                        modifier = Modifier
+                            .weight(1f)
+                            .padding(horizontal = 8.dp)
+                    )
+
+                    // Position / Duration text
+                    Text(
+                        text = "${formatTime(currentOfflineProgressMs)}/${formatTime(offlineDurationMs)}",
+                        color = Color.White,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Medium
+                    )
+
+                    Spacer(modifier = Modifier.width(12.dp))
+
+                    // PIP Button
+                    IconButton(
+                        onClick = {
+                            if (offlineActivity != null && android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                                offlineActivity.enterPictureInPictureMode(
+                                    android.app.PictureInPictureParams.Builder().build()
+                                )
+                            }
+                        },
+                        modifier = Modifier.size(32.dp)
+                    ) {
+                        Icon(
+                            Icons.Filled.PictureInPicture,
+                            contentDescription = "PiP Mode",
+                            tint = Color.White,
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.width(8.dp))
+
+                    // Fullscreen Toggle Button
+                    IconButton(
+                        onClick = {
+                            if (offlineActivity != null) {
+                                if (!isOfflineFullscreen) {
+                                    offlineActivity.requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+                                    offlineActivity.window.decorView.systemUiVisibility = (
+                                        android.view.View.SYSTEM_UI_FLAG_FULLSCREEN
+                                        or android.view.View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                                        or android.view.View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                                    )
+                                } else {
+                                    offlineActivity.requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                                    offlineActivity.window.decorView.systemUiVisibility = android.view.View.SYSTEM_UI_FLAG_VISIBLE
+                                }
+                            }
+                        },
+                        modifier = Modifier.size(32.dp)
+                    ) {
+                        Icon(
+                            imageVector = if (isOfflineFullscreen) Icons.Filled.FullscreenExit else Icons.Filled.Fullscreen,
+                            contentDescription = "Toggle Fullscreen",
+                            tint = Color.White,
+                            modifier = Modifier.size(22.dp)
+                        )
+                    }
                 }
             }
         }

@@ -34,8 +34,10 @@ class LocalMovieBoxServer(private val context: Context, private val port: Int = 
     private val mapAdapter = moshi.adapter(Map::class.java)
 
     private val okHttpClient = OkHttpClient.Builder()
-        .connectTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
-        .readTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
+        .connectionPool(okhttp3.ConnectionPool(10, 5, java.util.concurrent.TimeUnit.MINUTES))
+        .connectTimeout(6, java.util.concurrent.TimeUnit.SECONDS)
+        .readTimeout(8, java.util.concurrent.TimeUnit.SECONDS)
+        .retryOnConnectionFailure(true)
         .build()
 
     private val responseCache = java.util.concurrent.ConcurrentHashMap<String, Pair<Long, String>>()
@@ -53,6 +55,9 @@ class LocalMovieBoxServer(private val context: Context, private val port: Int = 
                 Log.i("LocalMovieBoxServer", "Server started on 127.0.0.1:$port")
                 while (isActive && isRunning) {
                     val socket = serverSocket?.accept() ?: break
+                    socket.tcpNoDelay = true // Disable Nagle algorithm: send data packets immediately without delay
+                    socket.sendBufferSize = 64 * 1024
+                    socket.receiveBufferSize = 64 * 1024
                     launch {
                         handleClient(socket)
                     }
@@ -156,6 +161,13 @@ class LocalMovieBoxServer(private val context: Context, private val port: Int = 
             val qParams = parseQueryParams(query)
             
             when {
+                path == "/clear-cache" -> {
+                    responseCache.clear()
+                    diskCachePrefs.edit().clear().apply()
+                    // Keep guestToken and auth_token untouched
+                    Pair(200, "{\"code\": 0, \"message\": \"Cache cleared\"}")
+                }
+
                 path == "/docs" || path == "/docs/" -> {
                     Pair(200, DocsHtml.getHtml(port))
                 }
@@ -1432,15 +1444,24 @@ class LocalMovieBoxServer(private val context: Context, private val port: Int = 
         )
         val clientInfoJson = toJsonString(clientInfoMap)
 
+        val acceptLanguage = when (region) {
+            "IN" -> "en-IN,hi-IN;q=0.9,en;q=0.8"
+            "US" -> "en-US,en;q=0.9"
+            "BR" -> "pt-BR,pt;q=0.9,en;q=0.8"
+            "RU" -> "ru-RU,ru;q=0.9,en;q=0.8"
+            else -> "en-US,en;q=0.9"
+        }
+
         val reqBuilder = Request.Builder()
             .url(httpUrl)
             .header("User-Agent", "MovieBoxPro/16.2.1 (Android 14; com.community.mbox.in)")
             .header("Accept", accept)
+            .header("Accept-Language", acceptLanguage)
             .header("Content-Type", contentType)
             .header("X-Sign-Version", "2.0")
             .header("appid", "4U01pxRu278GqCZKY9")
             .header("region", region)
-            .header("lang", "en")
+            .header("lang", if (region == "BR") "pt" else if (region == "RU") "ru" else "en")
             .header("os", "android")
             .header("X-Timestamp", timestamp)
             .header("Referer", "https://api.inmoviebox.com/")
@@ -1463,11 +1484,26 @@ class LocalMovieBoxServer(private val context: Context, private val port: Int = 
         reqBuilder.header("X-Client-Status", "1")
 
         reqBuilder.method(method, requestBody)
-        val builtRequest = reqBuilder.build()
+        var builtRequest = reqBuilder.build()
 
-        val response = okHttpClient.newCall(builtRequest).execute()
-        val resBody = response.body?.string() ?: ""
-        if (isCacheable && resBody.isNotEmpty() && !resBody.contains("Internal Server Error")) {
+        var response = okHttpClient.newCall(builtRequest).execute()
+        var resBody = response.body?.string() ?: ""
+
+        // Auto-recover from 401 JWT Token Expired by generating a fresh guest token and retrying immediately
+        if (response.code == 401 || resBody.contains("JWT token has expired") || resBody.contains("\"code\":401") || resBody.contains("\"code\": 401")) {
+            Log.w("LocalMovieBoxServer", "401 Expired Token encountered: bootstrapping a fresh guest token...")
+            guestToken = null
+            bootstrapGuestToken()
+            val freshToken = guestToken ?: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1aWQiOjcwNjU5NDg0MTAyMTM4MTYyMzIsInV0cCI6MSwiZXhwIjoxNzkxNzMyMjMzLCJpYXQiOjE3ODM5NTU5MzN9.7iyEzTj4vWAbOF0oXwNnZ0p3Nc1QaO6K9eMiGFyVfGs"
+            val retryReq = builtRequest.newBuilder()
+                .header("Authorization", "Bearer $freshToken")
+                .build()
+            response.close()
+            response = okHttpClient.newCall(retryReq).execute()
+            resBody = response.body?.string() ?: ""
+        }
+
+        if (isCacheable && resBody.isNotEmpty() && !resBody.contains("Internal Server Error") && !resBody.contains("JWT token has expired")) {
             val now = System.currentTimeMillis()
             responseCache[cacheKey] = Pair(now, resBody)
             diskCachePrefs.edit()
