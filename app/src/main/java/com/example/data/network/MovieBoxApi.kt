@@ -90,7 +90,7 @@ interface MovieBoxApi {
         @Body request: Map<String, String>
     ): Map<String, Any?>
 
-    @GET("wefeed-mobile-bff/upload/sts-token/v2")
+    @GET("wefeed-mobile-bff/upload/sts-token")
     suspend fun getStsToken(): Map<String, Any?>
 
     @GET("user-info")

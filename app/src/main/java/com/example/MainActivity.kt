@@ -28,16 +28,16 @@ class MainActivity : AppCompatActivity() {
         localServer?.start()
 
         val imageDispatcher = okhttp3.Dispatcher().apply {
-            maxRequests = 64
-            maxRequestsPerHost = 24
+            maxRequests = 128
+            maxRequestsPerHost = 48
         }
 
         // Dedicated high-speed OkHttpClient for image/poster loading with parallel connection pool
         val imageOkHttpClient = okhttp3.OkHttpClient.Builder()
             .dispatcher(imageDispatcher)
-            .connectionPool(okhttp3.ConnectionPool(32, 10, java.util.concurrent.TimeUnit.MINUTES))
-            .connectTimeout(5, java.util.concurrent.TimeUnit.SECONDS)
-            .readTimeout(8, java.util.concurrent.TimeUnit.SECONDS)
+            .connectionPool(okhttp3.ConnectionPool(64, 15, java.util.concurrent.TimeUnit.MINUTES))
+            .connectTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
+            .readTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
             .retryOnConnectionFailure(true)
             .build()
 

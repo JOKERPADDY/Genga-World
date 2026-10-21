@@ -75,9 +75,9 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.foundation.gestures.detectTapGestures
 
 
-fun downloadVideo(context: android.content.Context, url: String, title: String, posterUrl: String = "") {
+fun downloadVideo(context: android.content.Context, url: String, title: String, posterUrl: String = "", showToast: Boolean = true) {
     if (url.isEmpty()) {
-        android.widget.Toast.makeText(context, "Stream URL is empty", android.widget.Toast.LENGTH_SHORT).show()
+        if (showToast) android.widget.Toast.makeText(context, "Stream URL is empty", android.widget.Toast.LENGTH_SHORT).show()
         return
     }
     try {
@@ -138,9 +138,112 @@ fun downloadVideo(context: android.content.Context, url: String, title: String, 
         request.setNotificationVisibility(android.app.DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
         request.setDestinationInExternalPublicDir(android.os.Environment.DIRECTORY_MOVIES, "Genga World/$fileName")
         manager.enqueue(request)
-        android.widget.Toast.makeText(context, "Download started...", android.widget.Toast.LENGTH_SHORT).show()
+        if (showToast) {
+            android.widget.Toast.makeText(context, "Download started...", android.widget.Toast.LENGTH_SHORT).show()
+        }
     } catch (e: Exception) {
-        android.widget.Toast.makeText(context, "Failed to start download: ${e.message}", android.widget.Toast.LENGTH_SHORT).show()
+        if (showToast) {
+            android.widget.Toast.makeText(context, "Failed to start download: ${e.message}", android.widget.Toast.LENGTH_SHORT).show()
+        }
+    }
+}
+
+fun loadMediaOnCast(
+    castSession: com.google.android.gms.cast.framework.CastSession?,
+    streamUrl: String,
+    subject: MovieSubject,
+    viewModel: com.example.ui.viewmodel.MovieViewModel,
+    context: android.content.Context? = null
+) {
+    if (castSession == null || !castSession.isConnected || streamUrl.isEmpty()) return
+    try {
+        val remoteMediaClient = castSession.remoteMediaClient ?: return
+
+        // Prefer H.264 / universally compatible stream for Google Cast if available in playInfo
+        val availableStreams = viewModel.playInfo?.streamList ?: emptyList()
+        val preferredStream = availableStreams.find { s ->
+            val u = s.url.lowercase()
+            u.isNotEmpty() && !u.contains("b164fbfb43477929") && !u.contains("/h265/") && !u.contains("h265") && !u.contains("hevc")
+        } ?: viewModel.selectedStream
+
+        val rawTargetUrl = preferredStream?.url?.ifEmpty { streamUrl } ?: streamUrl
+        val targetCookie = preferredStream?.cookie ?: viewModel.selectedStream?.cookie ?: ""
+
+        // Resolve phone's LAN IP address for Cast receiver
+        val wifiIp = com.example.cast.CastForegroundService.getWifiIpAddress()
+        val castUrl = if (wifiIp != "127.0.0.1") {
+            val encodedTarget = java.net.URLEncoder.encode(rawTargetUrl, "UTF-8")
+            val encodedCookie = java.net.URLEncoder.encode(targetCookie, "UTF-8")
+            "http://$wifiIp:3000/cast-proxy?url=$encodedTarget&cookie=$encodedCookie"
+        } else {
+            rawTargetUrl
+        }
+
+        // If media is already loaded for this url, don't reload
+        val currentMedia = remoteMediaClient.mediaInfo
+        if (currentMedia?.contentId == castUrl || currentMedia?.contentUrl == castUrl ||
+            currentMedia?.contentId == rawTargetUrl || currentMedia?.contentUrl == rawTargetUrl) {
+            return
+        }
+
+        val movieMetadata = com.google.android.gms.cast.MediaMetadata(
+            if (subject.isTvShow) com.google.android.gms.cast.MediaMetadata.MEDIA_TYPE_TV_SHOW
+            else com.google.android.gms.cast.MediaMetadata.MEDIA_TYPE_MOVIE
+        ).apply {
+            val title = if (subject.isTvShow) {
+                "${subject.name} - S${viewModel.selectedSeason}E${viewModel.currentEpisode?.episodeNumber ?: 1}"
+            } else {
+                subject.name
+            }
+            putString(com.google.android.gms.cast.MediaMetadata.KEY_TITLE, title)
+            if (subject.isTvShow) {
+                putString(com.google.android.gms.cast.MediaMetadata.KEY_SERIES_TITLE, subject.name)
+                putInt(com.google.android.gms.cast.MediaMetadata.KEY_SEASON_NUMBER, viewModel.selectedSeason)
+                putInt(com.google.android.gms.cast.MediaMetadata.KEY_EPISODE_NUMBER, viewModel.currentEpisode?.episodeNumber ?: 1)
+            }
+            if (subject.poster.isNotEmpty()) {
+                addImage(com.google.android.gms.common.images.WebImage(android.net.Uri.parse(subject.poster)))
+            }
+        }
+
+        val isM3u8 = rawTargetUrl.contains(".m3u8", ignoreCase = true)
+        val isHevc = rawTargetUrl.contains("/h265/", ignoreCase = true) || rawTargetUrl.contains("hevc", ignoreCase = true)
+        val mimeType = when {
+            isM3u8 -> "application/x-mpegURL"
+            isHevc -> "video/mp4; codecs=\"hev1.1.6.L93.B0, mp4a.40.2\""
+            else -> "video/mp4"
+        }
+
+        val mediaInfo = com.google.android.gms.cast.MediaInfo.Builder(castUrl)
+            .setStreamType(com.google.android.gms.cast.MediaInfo.STREAM_TYPE_BUFFERED)
+            .setContentType(mimeType)
+            .setMetadata(movieMetadata)
+            .build()
+
+        val startPosition = viewModel.playbackProgressMs.coerceAtLeast(0L)
+        val loadOptions = com.google.android.gms.cast.MediaLoadOptions.Builder()
+            .setAutoplay(true)
+            .setPlayPosition(startPosition)
+            .build()
+
+        android.util.Log.i("MovieScreens", "Loading media on Cast: url=$castUrl mimeType=$mimeType pos=$startPosition")
+        val pendingResult = remoteMediaClient.load(mediaInfo, loadOptions)
+        pendingResult.setResultCallback { result ->
+            if (result.status.isSuccess) {
+                android.util.Log.i("MovieScreens", "Cast media load command acknowledged successfully")
+                if (context != null) {
+                    val mediaTitle = if (subject.isTvShow) "${subject.name} S${viewModel.selectedSeason}E${viewModel.currentEpisode?.episodeNumber ?: 1}" else subject.name
+                    com.example.cast.CastForegroundService.start(context, mediaTitle)
+                }
+            } else {
+                android.util.Log.w("MovieScreens", "Cast media load rejected: ${result.status.statusCode} ${result.status.statusMessage}")
+            }
+        }
+
+        // Pause local player since TV is now playing
+        viewModel.isPlaying = false
+    } catch (e: Exception) {
+        android.util.Log.e("MovieScreens", "Failed to cast media to TV", e)
     }
 }
 
@@ -1320,24 +1423,6 @@ fun HomeScreen(viewModel: MovieViewModel) {
     val categoryMovies by viewModel.categoryMovies.collectAsState()
 
     val context = LocalContext.current
-    val imageLoader = remember(context) { coil.Coil.imageLoader(context) }
-
-    // Prioritize and immediately start loading top hero banner and top row images first
-    LaunchedEffect(categoryMovies, trending) {
-        val topBannerPosters = categoryMovies.take(3).mapNotNull { it.poster.takeIf { p -> p.isNotBlank() } }
-        val topTrendingPosters = trending.take(6).mapNotNull { it.poster.takeIf { p -> p.isNotBlank() } }
-        val priorityPosters = (topBannerPosters + topTrendingPosters).distinct()
-
-        for (url in priorityPosters) {
-            val req = coil.request.ImageRequest.Builder(context)
-                .data(url)
-                .memoryCacheKey(url)
-                .diskCacheKey(url)
-                .build()
-            imageLoader.enqueue(req)
-        }
-    }
-
     if (viewModel.isDashboardLoading) {
         DashboardShimmerScreen()
     } else {
@@ -1381,12 +1466,13 @@ fun HomeScreen(viewModel: MovieViewModel) {
                                     .data(heroMovie.poster)
                                     .memoryCacheKey(heroMovie.poster)
                                     .diskCacheKey(heroMovie.poster)
+                                    .precision(coil.size.Precision.INEXACT)
                                     .crossfade(false)
                                     .build(),
                                 contentDescription = heroMovie.name,
                                 contentScale = ContentScale.Crop,
-                                placeholder = androidx.compose.ui.graphics.painter.ColorPainter(androidx.compose.ui.graphics.Color.DarkGray),
-                                error = androidx.compose.ui.graphics.painter.ColorPainter(androidx.compose.ui.graphics.Color.DarkGray),
+                                placeholder = androidx.compose.ui.graphics.painter.ColorPainter(androidx.compose.ui.graphics.Color(0xFF1E1E22)),
+                                error = androidx.compose.ui.graphics.painter.ColorPainter(androidx.compose.ui.graphics.Color(0xFF1E1E22)),
                                 modifier = Modifier.fillMaxSize()
                             )
                             // Gradient shading
@@ -1554,12 +1640,14 @@ fun MovieGridItem(movie: MovieSubject, showRating: Boolean = false, onClick: () 
                     .data(movie.poster)
                     .memoryCacheKey(movie.poster)
                     .diskCacheKey(movie.poster)
+                    .size(width = 330, height = 480) // Decode at exact 110dp x 160dp card resolution (~3x density) like Vega
+                    .precision(coil.size.Precision.INEXACT) // Fast decoding without full uncompressed bitmap in RAM
                     .crossfade(false)
                     .build(),
                 contentDescription = movie.name,
                 contentScale = ContentScale.Crop,
-                placeholder = androidx.compose.ui.graphics.painter.ColorPainter(androidx.compose.ui.graphics.Color.DarkGray),
-                error = androidx.compose.ui.graphics.painter.ColorPainter(androidx.compose.ui.graphics.Color.DarkGray),
+                placeholder = androidx.compose.ui.graphics.painter.ColorPainter(androidx.compose.ui.graphics.Color(0xFF1E1E22)),
+                error = androidx.compose.ui.graphics.painter.ColorPainter(androidx.compose.ui.graphics.Color(0xFF1E1E22)),
                 modifier = Modifier.fillMaxSize()
             )
             // Rating Tag
@@ -2187,9 +2275,17 @@ fun DetailScreen(viewModel: MovieViewModel) {
                         .height(300.dp)
                 ) {
                     AsyncImage(
-                        model = subject.poster,
+                        model = coil.request.ImageRequest.Builder(LocalContext.current)
+                            .data(subject.poster)
+                            .memoryCacheKey(subject.poster)
+                            .diskCacheKey(subject.poster)
+                            .precision(coil.size.Precision.INEXACT)
+                            .crossfade(false)
+                            .build(),
                         contentDescription = subject.name,
-                        contentScale = ContentScale.Crop, placeholder = androidx.compose.ui.graphics.painter.ColorPainter(androidx.compose.ui.graphics.Color.DarkGray), error = androidx.compose.ui.graphics.painter.ColorPainter(androidx.compose.ui.graphics.Color.DarkGray),
+                        contentScale = ContentScale.Crop,
+                        placeholder = androidx.compose.ui.graphics.painter.ColorPainter(androidx.compose.ui.graphics.Color(0xFF1E1E22)),
+                        error = androidx.compose.ui.graphics.painter.ColorPainter(androidx.compose.ui.graphics.Color(0xFF1E1E22)),
                         modifier = Modifier.fillMaxSize()
                     )
                     // Backdrop gradient
@@ -2495,6 +2591,8 @@ fun PlayerScreen(viewModel: MovieViewModel) {
     val subtitleUrl = viewModel.selectedSubtitle?.url
 
     var activeSheet by remember { mutableStateOf<String?>(null) }
+    var isDownloadSelectionMode by remember { mutableStateOf(false) }
+    val selectedDownloadEpisodes = remember { androidx.compose.runtime.mutableStateListOf<com.example.data.model.Episode>() }
     val configuration = androidx.compose.ui.platform.LocalConfiguration.current
     val screenWidth = configuration.screenWidthDp.dp
     val screenHeight = configuration.screenHeightDp.dp
@@ -2506,6 +2604,61 @@ fun PlayerScreen(viewModel: MovieViewModel) {
     var doubleTapActionText by remember { mutableStateOf<String?>(null) }
     var doubleTapActionSide by remember { mutableStateOf<String?>(null) } // "left", "center", "right"
     var gestureAnimTrigger by remember { mutableStateOf(0L) }
+
+    // Google Cast Session State & Listener
+    var isCastConnected by remember { mutableStateOf(false) }
+    val castContext = remember {
+        try {
+            com.google.android.gms.cast.framework.CastContext.getSharedInstance(context)
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    DisposableEffect(castContext, streamUrl) {
+        val sessionManager = castContext?.sessionManager
+        val castListener = object : com.google.android.gms.cast.framework.SessionManagerListener<com.google.android.gms.cast.framework.CastSession> {
+            override fun onSessionStarted(session: com.google.android.gms.cast.framework.CastSession, sessionId: String) {
+                isCastConnected = true
+                loadMediaOnCast(session, streamUrl, subject, viewModel, context)
+            }
+            override fun onSessionResumed(session: com.google.android.gms.cast.framework.CastSession, wasSuspended: Boolean) {
+                isCastConnected = true
+                loadMediaOnCast(session, streamUrl, subject, viewModel, context)
+            }
+            override fun onSessionEnded(session: com.google.android.gms.cast.framework.CastSession, error: Int) {
+                isCastConnected = false
+                com.example.cast.CastForegroundService.stop(context)
+            }
+            override fun onSessionSuspended(session: com.google.android.gms.cast.framework.CastSession, reason: Int) {
+                isCastConnected = false
+                com.example.cast.CastForegroundService.stop(context)
+            }
+            override fun onSessionStarting(session: com.google.android.gms.cast.framework.CastSession) {}
+            override fun onSessionStartFailed(session: com.google.android.gms.cast.framework.CastSession, error: Int) {
+                isCastConnected = false
+                com.example.cast.CastForegroundService.stop(context)
+            }
+            override fun onSessionEnding(session: com.google.android.gms.cast.framework.CastSession) {}
+            override fun onSessionResuming(session: com.google.android.gms.cast.framework.CastSession, sessionId: String) {}
+            override fun onSessionResumeFailed(session: com.google.android.gms.cast.framework.CastSession, error: Int) {
+                isCastConnected = false
+                com.example.cast.CastForegroundService.stop(context)
+            }
+        }
+
+        // Check current session immediately
+        val currentSession = sessionManager?.currentCastSession
+        if (currentSession != null && currentSession.isConnected) {
+            isCastConnected = true
+            loadMediaOnCast(currentSession, streamUrl, subject, viewModel, context)
+        }
+
+        sessionManager?.addSessionManagerListener(castListener, com.google.android.gms.cast.framework.CastSession::class.java)
+        onDispose {
+            sessionManager?.removeSessionManagerListener(castListener, com.google.android.gms.cast.framework.CastSession::class.java)
+        }
+    }
 
     // Initialize Media3 ExoPlayer
     val exoPlayer = remember {
@@ -3271,7 +3424,12 @@ fun PlayerScreen(viewModel: MovieViewModel) {
                                                 modifier = Modifier.size(1.dp)
                                             )
                                         }
-                                        Text("Not connected", color = CinematicRed, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                                        Text(
+                                            text = if (isCastConnected) "Connected (Playing on TV)" else "Not connected",
+                                            color = if (isCastConnected) Color(0xFF10B981) else CinematicRed,
+                                            fontSize = 14.sp,
+                                            fontWeight = FontWeight.Bold
+                                        )
                                     }
 
                                     // 1. Audio Dub Language
@@ -3476,18 +3634,10 @@ fun PlayerScreen(viewModel: MovieViewModel) {
                             }
                         }
                     } else {
-
-                        // Resource and Season selectors section
-                        Text(
-                            text = "Resource / Season",
-                            fontSize = 12.sp,
-                            fontWeight = FontWeight.Bold,
-                            color = TextSecondary,
-                            modifier = Modifier.padding(bottom = 6.dp)
-                        )
-
+                        // Resource, Season and Inline Download Trigger
                         Row(
-                            horizontalArrangement = Arrangement.spacedBy(12.dp),
+                            horizontalArrangement = Arrangement.spacedBy(10.dp),
+                            verticalAlignment = Alignment.CenterVertically,
                             modifier = Modifier.padding(bottom = 16.dp)
                         ) {
                             // Resource trigger button
@@ -3495,7 +3645,8 @@ fun PlayerScreen(viewModel: MovieViewModel) {
                                 Button(
                                     onClick = { activeSheet = "language" },
                                     colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2D2D30)),
-                                    shape = RoundedCornerShape(8.dp)
+                                    shape = RoundedCornerShape(8.dp),
+                                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp)
                                 ) {
                                     val currentDub = viewModel.selectedResource?.name ?: "Original Audio"
                                     Text(
@@ -3511,7 +3662,8 @@ fun PlayerScreen(viewModel: MovieViewModel) {
                                 Button(
                                     onClick = { activeSheet = "season" },
                                     colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2D2D30)),
-                                    shape = RoundedCornerShape(8.dp)
+                                    shape = RoundedCornerShape(8.dp),
+                                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp)
                                 ) {
                                     Text(
                                         text = "Season ${viewModel.selectedSeason.toString().padStart(2, '0')} ▾",
@@ -3520,54 +3672,257 @@ fun PlayerScreen(viewModel: MovieViewModel) {
                                     )
                                 }
                             }
+
+                            // Download Icon: placed neatly in line right after Season 01 button
+                            if (subject.isTvShow && viewModel.episodesList.isNotEmpty()) {
+                                if (isDownloadSelectionMode) {
+                                    Button(
+                                        onClick = {
+                                            isDownloadSelectionMode = false
+                                            selectedDownloadEpisodes.clear()
+                                        },
+                                        shape = RoundedCornerShape(8.dp),
+                                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF3B1818)),
+                                        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp)
+                                    ) {
+                                        Text("Cancel", color = Color(0xFFEF4444), fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                                    }
+                                } else {
+                                    Button(
+                                        onClick = {
+                                            isDownloadSelectionMode = true
+                                            selectedDownloadEpisodes.clear()
+                                        },
+                                        shape = RoundedCornerShape(8.dp),
+                                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2D2D30)),
+                                        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp)
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Filled.Download,
+                                            contentDescription = "Download multiple episodes",
+                                            tint = Color.White,
+                                            modifier = Modifier.size(16.dp)
+                                        )
+                                    }
+                                }
+                            }
                         }
 
-                        // Episodes Grid list
+                        // Episodes Section: Download Selection List OR Normal 4-Column Grid
                         if (subject.isTvShow) {
-                            val chunkedEp = viewModel.episodesList.chunked(4)
-                            Column(
-                                verticalArrangement = Arrangement.spacedBy(10.dp),
-                                modifier = Modifier.fillMaxWidth()
-                            ) {
-                                chunkedEp.forEach { rowItems ->
-                                    Row(
-                                        modifier = Modifier.fillMaxWidth(),
-                                        horizontalArrangement = Arrangement.spacedBy(12.dp)
-                                    ) {
-                                        rowItems.forEach { ep ->
-                                            val isCurrentEp = viewModel.currentEpisode?.episodeId == ep.episodeId
-                                            Card(
+                            if (isDownloadSelectionMode) {
+                                // Multi-select download list (No video length/size shown, right-side red circle)
+                                Column(
+                                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                                    modifier = Modifier.fillMaxWidth().padding(bottom = 120.dp) // generous space for sticky bottom bar + nav insets
+                                ) {
+                                    viewModel.episodesList.forEach { ep ->
+                                        val isSelected = selectedDownloadEpisodes.any { it.episodeId == ep.episodeId }
+                                        Card(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .clickable {
+                                                    if (isSelected) {
+                                                        selectedDownloadEpisodes.removeAll { it.episodeId == ep.episodeId }
+                                                    } else {
+                                                        selectedDownloadEpisodes.add(ep)
+                                                    }
+                                                },
+                                            shape = RoundedCornerShape(10.dp),
+                                            colors = CardDefaults.cardColors(
+                                                containerColor = if (isSelected) Color(0xFF271B1B) else Color(0xFF1E1E22)
+                                            ),
+                                            border = if (isSelected) androidx.compose.foundation.BorderStroke(1.dp, CinematicRed) else null
+                                        ) {
+                                            Row(
                                                 modifier = Modifier
-                                                    .weight(1f)
-                                                    .height(48.dp)
-                                                    .clickable { viewModel.selectEpisode(ep) },
-                                                shape = RoundedCornerShape(8.dp),
-                                                colors = CardDefaults.cardColors(
-                                                    containerColor = if (isCurrentEp) Color(0xFF115E59) else Color(0xFF2E2E30)
-                                                )
+                                                    .fillMaxWidth()
+                                                    .padding(horizontal = 16.dp, vertical = 14.dp),
+                                                horizontalArrangement = Arrangement.SpaceBetween,
+                                                verticalAlignment = Alignment.CenterVertically
                                             ) {
+                                                // Left Side: Episode Name only (Clean, no length, no size)
+                                                Text(
+                                                    text = "Episode ${ep.episodeNumber.toString().padStart(2, '0')}",
+                                                    color = Color.White,
+                                                    fontSize = 15.sp,
+                                                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium
+                                                )
+
+                                                // Right Side: Circle indicator (Turns Red when clicked)
                                                 Box(
-                                                    modifier = Modifier.fillMaxSize(),
+                                                    modifier = Modifier
+                                                        .size(24.dp)
+                                                        .clip(CircleShape)
+                                                        .background(if (isSelected) CinematicRed else Color.Transparent)
+                                                        .then(
+                                                            if (!isSelected) {
+                                                                Modifier.border(2.dp, Color(0xFF6B7280), CircleShape)
+                                                            } else {
+                                                                Modifier
+                                                            }
+                                                        ),
                                                     contentAlignment = Alignment.Center
                                                 ) {
-                                                    Text(
-                                                        text = ep.episodeNumber.toString().padStart(2, '0'),
-                                                        color = if (isCurrentEp) Color(0xFF2DD4BF) else Color.White,
-                                                        fontWeight = FontWeight.Bold,
-                                                        fontSize = 14.sp
-                                                    )
+                                                    if (isSelected) {
+                                                        Icon(
+                                                            imageVector = Icons.Filled.Check,
+                                                            contentDescription = "Selected",
+                                                            tint = Color.White,
+                                                            modifier = Modifier.size(16.dp)
+                                                        )
+                                                    }
                                                 }
                                             }
                                         }
-                                        // Handle odd items padding
-                                        if (rowItems.size < 4) {
-                                            Spacer(modifier = Modifier.weight((4 - rowItems.size).toFloat()))
+                                    }
+                                }
+                            } else {
+                                // Normal 4-Column Watch Grid
+                                val chunkedEp = viewModel.episodesList.chunked(4)
+                                Column(
+                                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                                    modifier = Modifier.fillMaxWidth().padding(bottom = 24.dp)
+                                ) {
+                                    chunkedEp.forEach { rowItems ->
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.spacedBy(12.dp)
+                                        ) {
+                                            rowItems.forEach { ep ->
+                                                val isCurrentEp = viewModel.currentEpisode?.episodeId == ep.episodeId
+                                                Card(
+                                                    modifier = Modifier
+                                                        .weight(1f)
+                                                        .height(48.dp)
+                                                        .clickable { viewModel.selectEpisode(ep) },
+                                                    shape = RoundedCornerShape(8.dp),
+                                                    colors = CardDefaults.cardColors(
+                                                        containerColor = if (isCurrentEp) Color(0xFF115E59) else Color(0xFF2E2E30)
+                                                    )
+                                                ) {
+                                                    Box(
+                                                        modifier = Modifier.fillMaxSize(),
+                                                        contentAlignment = Alignment.Center
+                                                    ) {
+                                                        Text(
+                                                            text = ep.episodeNumber.toString().padStart(2, '0'),
+                                                            color = if (isCurrentEp) Color(0xFF2DD4BF) else Color.White,
+                                                            fontWeight = FontWeight.Bold,
+                                                            fontSize = 14.sp
+                                                        )
+                                                    }
+                                                }
+                                            }
+                                            // Handle odd items padding
+                                            if (rowItems.size < 4) {
+                                                Spacer(modifier = Modifier.weight((4 - rowItems.size).toFloat()))
+                                            }
                                         }
                                     }
                                 }
                             }
                         }
                     }
+            }
+
+            // Sticky Bottom Action Bar for Download All / Selected (Always visible on screen, no need to scroll to bottom!)
+            if (activeSheet == null && isDownloadSelectionMode && subject.isTvShow) {
+                Card(
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .fillMaxWidth()
+                        .navigationBarsPadding()
+                        .padding(12.dp),
+                    shape = RoundedCornerShape(12.dp),
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFF232328)),
+                    elevation = CardDefaults.cardElevation(defaultElevation = 8.dp)
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 14.dp, vertical = 10.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        // Select All toggle
+                        val allSelected = selectedDownloadEpisodes.size == viewModel.episodesList.size && viewModel.episodesList.isNotEmpty()
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(8.dp))
+                                .clickable {
+                                    if (allSelected) {
+                                        selectedDownloadEpisodes.clear()
+                                    } else {
+                                        selectedDownloadEpisodes.clear()
+                                        selectedDownloadEpisodes.addAll(viewModel.episodesList)
+                                    }
+                                }
+                                .padding(6.dp)
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(22.dp)
+                                    .clip(CircleShape)
+                                    .background(if (allSelected) CinematicRed else Color.Transparent)
+                                    .then(
+                                        if (!allSelected) Modifier.border(2.dp, Color(0xFF9CA3AF), CircleShape) else Modifier
+                                    ),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                if (allSelected) {
+                                    Icon(
+                                        imageVector = Icons.Filled.Check,
+                                        contentDescription = "All Selected",
+                                        tint = Color.White,
+                                        modifier = Modifier.size(15.dp)
+                                    )
+                                }
+                            }
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(
+                                text = "Select All",
+                                color = Color.White,
+                                fontSize = 14.sp,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                        }
+
+                        // Prominent Download Button
+                        Button(
+                            onClick = {
+                                if (selectedDownloadEpisodes.isNotEmpty()) {
+                                    val listToDownload = selectedDownloadEpisodes.toList()
+                                    viewModel.downloadEpisodesBatch(context, listToDownload)
+                                    isDownloadSelectionMode = false
+                                    selectedDownloadEpisodes.clear()
+                                } else {
+                                    Toast.makeText(context, "Please select at least 1 episode", Toast.LENGTH_SHORT).show()
+                                }
+                            },
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = if (selectedDownloadEpisodes.isNotEmpty()) CinematicRed else Color(0xFF3F3F46)
+                            ),
+                            shape = RoundedCornerShape(8.dp),
+                            contentPadding = PaddingValues(horizontal = 18.dp, vertical = 10.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Filled.Download,
+                                contentDescription = "Download",
+                                tint = Color.White,
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = if (selectedDownloadEpisodes.isNotEmpty()) "Download (${selectedDownloadEpisodes.size})" else "Download",
+                                color = Color.White,
+                                fontSize = 14.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
+                }
             }
         }
     }
@@ -3654,7 +4009,12 @@ fun PlayerScreen(viewModel: MovieViewModel) {
                                             modifier = Modifier.size(1.dp)
                                         )
                                     }
-                                    Text("Not connected", color = CinematicRed, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                                    Text(
+                                        text = if (isCastConnected) "Connected (Playing on TV)" else "Not connected",
+                                        color = if (isCastConnected) Color(0xFF10B981) else CinematicRed,
+                                        fontSize = 14.sp,
+                                        fontWeight = FontWeight.Bold
+                                    )
                                 }
 
                                 // 1. Audio Dub Language
@@ -3978,13 +4338,19 @@ fun DownloadScreen(viewModel: MovieViewModel) {
                             val titleIdx = cursor.getColumnIndex(android.app.DownloadManager.COLUMN_TITLE)
                             val soFarIdx = cursor.getColumnIndex(android.app.DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR)
                             val totalIdx = cursor.getColumnIndex(android.app.DownloadManager.COLUMN_TOTAL_SIZE_BYTES)
+                            val statusIdx = cursor.getColumnIndex(android.app.DownloadManager.COLUMN_STATUS)
+                            val reasonIdx = cursor.getColumnIndex(android.app.DownloadManager.COLUMN_REASON)
+                            val uriIdx = cursor.getColumnIndex(android.app.DownloadManager.COLUMN_URI)
                             while (cursor.moveToNext()) {
                                 val id = if (idIdx >= 0) cursor.getLong(idIdx) else 0L
                                 val title = if (titleIdx >= 0) cursor.getString(titleIdx) ?: "Downloading..." else "Downloading..."
                                 val bytesDownloaded = if (soFarIdx >= 0) cursor.getLong(soFarIdx) else 0L
                                 val bytesTotal = if (totalIdx >= 0) cursor.getLong(totalIdx) else 0L
+                                val status = if (statusIdx >= 0) cursor.getInt(statusIdx) else android.app.DownloadManager.STATUS_RUNNING
+                                val reason = if (reasonIdx >= 0) cursor.getInt(reasonIdx) else 0
+                                val uri = if (uriIdx >= 0) cursor.getString(uriIdx) ?: "" else ""
                                 val progress = if (bytesTotal > 0) ((bytesDownloaded * 100) / bytesTotal).toInt() else 0
-                                currentActive.add(ActiveDownload(id, title, progress, bytesDownloaded, bytesTotal))
+                                currentActive.add(ActiveDownload(id, title, progress, bytesDownloaded, bytesTotal, status, reason, uri))
                             }
                         }
                     } catch (e: Exception) { }
@@ -4121,10 +4487,82 @@ fun DownloadScreen(viewModel: MovieViewModel) {
                                         trackColor = ObsidianDark
                                     )
                                     Spacer(modifier = Modifier.height(4.dp))
-                                    Text(
-                                        text = "${active.progress}% (${(active.downloadedBytes / (1024 * 1024))}MB / ${if (active.totalBytes > 0) (active.totalBytes / (1024 * 1024)).toString() + "MB" else "Unknown"})",
-                                        color = TextSecondary,
-                                        fontSize = 11.sp
+                                    val statusText = when (active.status) {
+                                        android.app.DownloadManager.STATUS_PAUSED -> {
+                                            if (active.reason == android.app.DownloadManager.PAUSED_WAITING_FOR_NETWORK ||
+                                                active.reason == android.app.DownloadManager.PAUSED_QUEUED_FOR_WIFI) {
+                                                "Waiting for network..."
+                                            } else {
+                                                "Paused"
+                                            }
+                                        }
+                                        android.app.DownloadManager.STATUS_PENDING -> "Pending..."
+                                        else -> "Downloading..."
+                                    }
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text(
+                                            text = "${active.progress}% (${(active.downloadedBytes / (1024 * 1024))}MB / ${if (active.totalBytes > 0) (active.totalBytes / (1024 * 1024)).toString() + "MB" else "Unknown"}) • $statusText",
+                                            color = if (active.status == android.app.DownloadManager.STATUS_PAUSED) Color(0xFFFBBF24) else TextSecondary,
+                                            fontSize = 11.sp
+                                        )
+                                    }
+                                }
+
+                                Spacer(modifier = Modifier.width(8.dp))
+
+                                // Pause / Resume & Cancel Control Buttons
+                                val isPaused = active.status == android.app.DownloadManager.STATUS_PAUSED
+                                val manager = remember { context.getSystemService(android.content.Context.DOWNLOAD_SERVICE) as? android.app.DownloadManager }
+
+                                IconButton(
+                                    onClick = {
+                                        if (manager != null) {
+                                            if (isPaused) {
+                                                // Resume: resume download using DownloadManager internal reflection or re-enqueue
+                                                try {
+                                                    val resumeMethod = manager.javaClass.getMethod("resumeDownload", Long::class.javaPrimitiveType)
+                                                    resumeMethod.invoke(manager, active.id)
+                                                } catch (_: Exception) {
+                                                    // Fallback: restart or re-request if reflection not available on vendor ROM
+                                                    try {
+                                                        val restartMethod = manager.javaClass.getMethod("restartDownload", LongArray::class.java)
+                                                        restartMethod.invoke(manager, longArrayOf(active.id))
+                                                    } catch (_: Exception) {}
+                                                }
+                                            } else {
+                                                // Pause download
+                                                try {
+                                                    val pauseMethod = manager.javaClass.getMethod("pauseDownload", Long::class.javaPrimitiveType)
+                                                    pauseMethod.invoke(manager, active.id)
+                                                } catch (_: Exception) {}
+                                            }
+                                        }
+                                    },
+                                    modifier = Modifier.size(32.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = if (isPaused) Icons.Filled.PlayArrow else Icons.Filled.Pause,
+                                        contentDescription = if (isPaused) "Resume" else "Pause",
+                                        tint = if (isPaused) Color(0xFF10B981) else Color.White,
+                                        modifier = Modifier.size(20.dp)
+                                    )
+                                }
+
+                                IconButton(
+                                    onClick = {
+                                        manager?.remove(active.id)
+                                    },
+                                    modifier = Modifier.size(32.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Filled.Close,
+                                        contentDescription = "Cancel Download",
+                                        tint = Color(0xFFEF4444),
+                                        modifier = Modifier.size(18.dp)
                                     )
                                 }
                             }

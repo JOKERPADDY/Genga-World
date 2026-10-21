@@ -90,10 +90,17 @@ class LocalMovieBoxServer(private val context: Context, private val port: Int = 
 
                 // Read headers
                 var contentLength = 0
+                val headersMap = mutableMapOf<String, String>()
                 var lineHeader = reader.readLine()
                 while (lineHeader != null && lineHeader.isNotEmpty()) {
-                    if (lineHeader.startsWith("Content-Length:", ignoreCase = true)) {
-                        contentLength = lineHeader.substring("Content-Length:".length).trim().toIntOrNull() ?: 0
+                    val colonIdx = lineHeader.indexOf(':')
+                    if (colonIdx != -1) {
+                        val headerName = lineHeader.substring(0, colonIdx).trim()
+                        val headerVal = lineHeader.substring(colonIdx + 1).trim()
+                        headersMap[headerName.lowercase()] = headerVal
+                        if (headerName.equals("Content-Length", ignoreCase = true)) {
+                            contentLength = headerVal.toIntOrNull() ?: 0
+                        }
                     }
                     lineHeader = reader.readLine()
                 }
@@ -116,27 +123,102 @@ class LocalMovieBoxServer(private val context: Context, private val port: Int = 
                 val path = if (questionMarkIndex != -1) pathAndQuery.substring(0, questionMarkIndex) else pathAndQuery
                 val query = if (questionMarkIndex != -1) pathAndQuery.substring(questionMarkIndex + 1) else ""
 
-                 Log.i("LocalMovieBoxServer", "Incoming: $method $pathAndQuery")
-                 val responsePair = routeRequest(method, path, query, body)
-                 val contentType = when {
-                     path == "/docs" || path == "/docs/" -> "text/html; charset=utf-8"
-                     path.endsWith(".jpg") || path.endsWith(".jpeg") -> "image/jpeg"
-                     path.endsWith(".png") -> "image/png"
-                     else -> "application/json; charset=utf-8"
-                 }
-                 sendResponse(socket, responsePair.first, responsePair.second, contentType)
-             } catch (e: Exception) {
-                 Log.e("LocalMovieBoxServer", "Error handling client", e)
-                 try {
-                     sendResponse(socket, 500, "{\"code\": 500, \"msg\": \"Internal Server Error\"}")
-                 } catch (ex: Exception) {}
-             } finally {
-                 try {
-                     socket.close()
-                 } catch (e: Exception) {}
-             }
-         }
-     }
+                if (path == "/cast-proxy") {
+                    handleCastProxy(socket, method, query, headersMap)
+                    return@withContext
+                }
+
+                Log.i("LocalMovieBoxServer", "Incoming: $method $pathAndQuery")
+                val responsePair = routeRequest(method, path, query, body)
+                val contentType = when {
+                    path == "/docs" || path == "/docs/" -> "text/html; charset=utf-8"
+                    path.endsWith(".jpg") || path.endsWith(".jpeg") -> "image/jpeg"
+                    path.endsWith(".png") -> "image/png"
+                    else -> "application/json; charset=utf-8"
+                }
+                sendResponse(socket, responsePair.first, responsePair.second, contentType)
+            } catch (e: Exception) {
+                Log.e("LocalMovieBoxServer", "Error handling client", e)
+                try {
+                    sendResponse(socket, 500, "{\"code\": 500, \"msg\": \"Internal Server Error\"}")
+                } catch (ex: Exception) {}
+            } finally {
+                try {
+                    socket.close()
+                } catch (e: Exception) {}
+            }
+        }
+    }
+
+    private fun handleCastProxy(
+        socket: Socket,
+        method: String,
+        query: String,
+        clientHeaders: Map<String, String>
+    ) {
+        val qParams = parseQueryParams(query)
+        val targetUrl = qParams["url"] ?: run {
+            sendResponse(socket, 400, "{\"error\": \"Missing url parameter\"}")
+            return
+        }
+        val cookie = qParams["cookie"] ?: ""
+
+        val requestBuilder = Request.Builder().url(targetUrl)
+        requestBuilder.header("User-Agent", "MovieBoxPro/16.2.1 (Android 14; com.community.mbox.in)")
+        if (cookie.isNotBlank()) {
+            requestBuilder.header("Cookie", cookie)
+        }
+
+        val rangeHeader = clientHeaders["range"]
+        if (!rangeHeader.isNullOrBlank()) {
+            requestBuilder.header("Range", rangeHeader)
+        }
+
+        if (method.equals("HEAD", ignoreCase = true)) {
+            requestBuilder.head()
+        }
+
+        try {
+            val response = okHttpClient.newCall(requestBuilder.build()).execute()
+            val output: OutputStream = socket.getOutputStream()
+            val code = response.code
+            val contentType = response.header("Content-Type") ?: if (targetUrl.contains(".m3u8")) "application/x-mpegURL" else "video/mp4"
+            val body = response.body
+            val contentLength = body?.contentLength() ?: -1L
+
+            val sb = StringBuilder()
+            sb.append("HTTP/1.1 ").append(code).append(" ").append(response.message.ifBlank { "OK" }).append("\r\n")
+            sb.append("Content-Type: ").append(contentType).append("\r\n")
+            if (contentLength >= 0) {
+                sb.append("Content-Length: ").append(contentLength).append("\r\n")
+            }
+            sb.append("Accept-Ranges: bytes\r\n")
+            response.header("Content-Range")?.let {
+                sb.append("Content-Range: ").append(it).append("\r\n")
+            }
+            sb.append("Access-Control-Allow-Origin: *\r\n")
+            sb.append("Access-Control-Allow-Methods: GET, HEAD, OPTIONS\r\n")
+            sb.append("Access-Control-Allow-Headers: Range, Origin, Accept, Content-Type\r\n")
+            sb.append("Access-Control-Expose-Headers: Content-Length, Content-Range, Accept-Ranges\r\n")
+            sb.append("Connection: close\r\n\r\n")
+
+            output.write(sb.toString().toByteArray(StandardCharsets.UTF_8))
+            output.flush()
+
+            if (!method.equals("HEAD", ignoreCase = true) && body != null) {
+                val inputStream = body.byteStream()
+                val buffer = ByteArray(64 * 1024)
+                var bytesRead: Int
+                while (inputStream.read(buffer).also { bytesRead = it } != -1) {
+                    output.write(buffer, 0, bytesRead)
+                }
+                output.flush()
+            }
+            response.close()
+        } catch (e: Exception) {
+            Log.e("LocalMovieBoxServer", "Cast proxy stream error: ${e.message}")
+        }
+    }
  
      private fun sendResponse(socket: Socket, statusCode: Int, body: String, contentType: String = "application/json; charset=utf-8") {
          val output: OutputStream = socket.getOutputStream()
@@ -280,12 +362,14 @@ class LocalMovieBoxServer(private val context: Context, private val port: Int = 
                             .putString("user_info_json", toJsonString(data))
                             .apply()
                         
+                        val avatar = (data["avatarUrl"] ?: data["avatar"] ?: "").toString()
+
                         val targetResponse = mapOf(
                             "status" to "success",
                             "user" to mapOf(
                                 "username" to (data["userName"] ?: data["nickname"] ?: account),
                                 "nickname" to (data["nickname"] ?: account),
-                                "avatar" to (data["avatarUrl"] ?: ""),
+                                "avatar" to avatar,
                                 "email" to (data["email"] ?: account),
                                 "vip" to (data["vip"] ?: 0),
                                 "userId" to (data["userId"] ?: "")
@@ -325,12 +409,14 @@ class LocalMovieBoxServer(private val context: Context, private val port: Int = 
                     val data = responseMap["data"] as? Map<String, Any?>
 
                     if (code == 0 || code == 200) {
+                        val avatar = (data?.get("avatarUrl") ?: data?.get("avatar") ?: "").toString()
+
                         val targetResponse = mapOf(
                             "status" to "success",
                             "user" to mapOf(
                                 "username" to (data?.get("userName") ?: account),
                                 "nickname" to (data?.get("nickname") ?: account),
-                                "avatar" to (data?.get("avatarUrl") ?: ""),
+                                "avatar" to avatar,
                                 "email" to (data?.get("email") ?: account),
                                 "vip" to (data?.get("vip") ?: 0),
                                 "userId" to (data?.get("userId") ?: "")
@@ -370,9 +456,9 @@ class LocalMovieBoxServer(private val context: Context, private val port: Int = 
                     }
                 }
 
-                path == "/wefeed-mobile-bff/upload/sts-token/v2" -> {
+                path == "/wefeed-mobile-bff/upload/sts-token" || path == "/wefeed-mobile-bff/upload/sts-token/v2" -> {
                     try {
-                        val rawResponse = makeOfficialRequest("GET", "/wefeed-mobile-bff/upload/sts-token/v2")
+                        val rawResponse = makeOfficialRequest("GET", path)
                         Pair(200, rawResponse)
                     } catch (e: Exception) {
                         Pair(500, "{\"code\": 500, \"message\": \"${e.message}\"}")

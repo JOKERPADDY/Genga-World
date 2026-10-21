@@ -52,6 +52,9 @@ class MovieRepository(
 
     private val detailCache = java.util.concurrent.ConcurrentHashMap<String, MovieSubject>()
 
+    private val memoryTrendingCache = java.util.concurrent.CopyOnWriteArrayList<MovieSubject>()
+    private val memoryCategoryCache = java.util.concurrent.ConcurrentHashMap<Int, List<MovieSubject>>()
+
     suspend fun getTrending(page: Int = 1, pageSize: Int = 20): List<MovieSubject> = withContext(Dispatchers.IO) {
         try {
             val response = api.getTrending(page, pageSize)
@@ -59,12 +62,16 @@ class MovieRepository(
                 if (data.list.isNotEmpty()) data.list else data.items
             } ?: emptyList()
             if ((response.code == 200 || response.code == 0) && list.isNotEmpty()) {
+                if (page == 1) {
+                    memoryTrendingCache.clear()
+                    memoryTrendingCache.addAll(list)
+                }
                 list
             } else {
-                emptyList()
+                if (page == 1 && memoryTrendingCache.isNotEmpty()) memoryTrendingCache.toList() else emptyList()
             }
         } catch (e: Exception) {
-            emptyList()
+            if (page == 1 && memoryTrendingCache.isNotEmpty()) memoryTrendingCache.toList() else emptyList()
         }
     }
 
@@ -86,18 +93,22 @@ class MovieRepository(
     }
 
     suspend fun getCategoryList(categoryId: Int, page: Int = 1, pageSize: Int = 20): List<MovieSubject> = withContext(Dispatchers.IO) {
+        val cached = memoryCategoryCache[categoryId]
         try {
             val response = api.getList(GetListRequest(categoryId, page, pageSize))
             val list = response.data?.let { data ->
                 if (data.list.isNotEmpty()) data.list else data.items
             } ?: emptyList()
             if ((response.code == 200 || response.code == 0) && list.isNotEmpty()) {
+                if (page == 1) {
+                    memoryCategoryCache[categoryId] = list
+                }
                 list
             } else {
-                emptyList()
+                cached ?: emptyList()
             }
         } catch (e: Exception) {
-            emptyList()
+            cached ?: emptyList()
         }
     }
 

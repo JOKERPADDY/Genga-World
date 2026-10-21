@@ -20,6 +20,8 @@ import com.example.data.preferences.PreferencesManager
 import com.example.data.repository.MovieRepository
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.security.MessageDigest
@@ -27,7 +29,17 @@ import android.widget.Toast
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import androidx.compose.runtime.snapshotFlow
 
-data class ActiveDownload(val id: Long, val title: String, val progress: Int, val downloadedBytes: Long, val totalBytes: Long)
+data class ActiveDownload(
+    val id: Long,
+    val title: String,
+    val progress: Int,
+    val downloadedBytes: Long,
+    val totalBytes: Long,
+    val status: Int = android.app.DownloadManager.STATUS_RUNNING,
+    val reason: Int = 0,
+    val url: String = "",
+    val posterUrl: String = ""
+)
 
 class MovieViewModel(application: Application) : AndroidViewModel(application) {
     private val prefs = PreferencesManager(application)
@@ -348,15 +360,56 @@ class MovieViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun installApk(context: android.content.Context, apkFile: java.io.File) {
         try {
+            // Check if "Install Unknown Apps" permission is granted on Android 8.0+
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                if (!context.packageManager.canRequestPackageInstalls()) {
+                    val settingsIntent = android.content.Intent(
+                        android.provider.Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                        android.net.Uri.parse("package:${context.packageName}")
+                    ).apply {
+                        flags = android.content.Intent.FLAG_ACTIVITY_NEW_TASK
+                    }
+                    context.startActivity(settingsIntent)
+                    Toast.makeText(context, "Please allow 'Install unknown apps' and tap Update again", Toast.LENGTH_LONG).show()
+                    return
+                }
+            }
+
             val apkUri = androidx.core.content.FileProvider.getUriForFile(
                 context,
                 "${context.packageName}.provider",
                 apkFile
             )
+
             val intent = android.content.Intent(android.content.Intent.ACTION_VIEW).apply {
                 setDataAndType(apkUri, "application/vnd.android.package-archive")
                 flags = android.content.Intent.FLAG_ACTIVITY_NEW_TASK or android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION
             }
+
+            // Explicitly grant read permissions to all candidate activities
+            val resInfoList = context.packageManager.queryIntentActivities(
+                intent,
+                android.content.pm.PackageManager.MATCH_DEFAULT_ONLY
+            )
+            for (resolveInfo in resInfoList) {
+                val pkgName = resolveInfo.activityInfo.packageName
+                context.grantUriPermission(
+                    pkgName,
+                    apkUri,
+                    android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
+            }
+
+            // Prioritize standard Android/Google Package Installers over OEM phone managers
+            val preferredInstallers = listOf(
+                "com.google.android.packageinstaller",
+                "com.android.packageinstaller"
+            )
+            val systemInstaller = resInfoList.firstOrNull { it.activityInfo.packageName in preferredInstallers }
+            if (systemInstaller != null) {
+                intent.setClassName(systemInstaller.activityInfo.packageName, systemInstaller.activityInfo.name)
+            }
+
             context.startActivity(intent)
         } catch (e: Exception) {
             Toast.makeText(context, "Failed to launch installer: ${e.message}", Toast.LENGTH_LONG).show()
@@ -600,70 +653,128 @@ class MovieViewModel(application: Application) : AndroidViewModel(application) {
                 val timestamp = System.currentTimeMillis()
                 val objectKey = "OSS${timestamp}_avatar.jpg"
 
-                // 3. Generate date formats for AWS V4
-                val sdfAmz = java.text.SimpleDateFormat("yyyyMMdd'T'HHmmss'Z'", java.util.Locale.US).apply { timeZone = java.util.TimeZone.getTimeZone("UTC") }
-                val sdfDate = java.text.SimpleDateFormat("yyyyMMdd", java.util.Locale.US).apply { timeZone = java.util.TimeZone.getTimeZone("UTC") }
-                val now = java.util.Date()
-                val amzDate = sdfAmz.format(now)
-                val dateStamp = sdfDate.format(now)
-
-                // 4. Payload hash
-                val md256 = java.security.MessageDigest.getInstance("SHA-256")
-                val payloadHash = md256.digest(imageBytes).joinToString("") { "%02x".format(it) }
-
+                val storage = data["storage"]?.toString() ?: ""
                 val cleanEndpoint = endpoint.replace("https://", "").replace("http://", "").removeSuffix("/")
                 val host = "$bucket.$cleanEndpoint"
-                val putUrl = "https://$host/$objectKey"
+                val publicUrl = "https://$host/$objectKey"
 
-                val canonicalUri = "/$objectKey"
-                val canonicalQuerystring = ""
-                val canonicalHeaders = "host:$host\nx-amz-content-sha256:$payloadHash\nx-amz-date:$amzDate\nx-amz-security-token:$securityToken\n"
-                val signedHeaders = "host;x-amz-content-sha256;x-amz-date;x-amz-security-token"
-                val canonicalRequest = "PUT\n$canonicalUri\n$canonicalQuerystring\n$canonicalHeaders\n$signedHeaders\n$payloadHash"
+                val isAliyunOss = storage.equals("OSS", ignoreCase = true) || endpoint.contains("aliyuncs.com")
 
-                val credentialScope = "$dateStamp/$region/s3/aws4_request"
-                val stringToSign = "AWS4-HMAC-SHA256\n$amzDate\n$credentialScope\n${md256.digest(canonicalRequest.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }}"
-
-                fun hmacSha256(key: ByteArray, message: String): ByteArray {
-                    val mac = javax.crypto.Mac.getInstance("HmacSHA256")
-                    mac.init(javax.crypto.spec.SecretKeySpec(key, "HmacSHA256"))
-                    return mac.doFinal(message.toByteArray(Charsets.UTF_8))
-                }
-
-                val kDate = hmacSha256(("AWS4$accessKeySecret").toByteArray(Charsets.UTF_8), dateStamp)
-                val kRegion = hmacSha256(kDate, region)
-                val kService = hmacSha256(kRegion, "s3")
-                val kSigning = hmacSha256(kService, "aws4_request")
-                val signatureBytes = hmacSha256(kSigning, stringToSign)
-                val signature = signatureBytes.joinToString("") { "%02x".format(it) }
-
-                val authorizationHeader = "AWS4-HMAC-SHA256 Credential=$accessKeyId/$credentialScope, SignedHeaders=$signedHeaders, Signature=$signature"
-
-                // 5. Execute PUT request to AWS S3
-                val okHttpClient = okhttp3.OkHttpClient()
+                val okHttpClient = okhttp3.OkHttpClient.Builder()
+                    .connectTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
+                    .writeTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+                    .readTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+                    .retryOnConnectionFailure(true)
+                    .build()
                 val requestBody = okhttp3.RequestBody.create("image/jpeg".toMediaTypeOrNull(), imageBytes)
 
-                val request = okhttp3.Request.Builder()
-                    .url(putUrl)
-                    .put(requestBody)
-                    .header("Host", host)
-                    .header("x-amz-date", amzDate)
-                    .header("x-amz-content-sha256", payloadHash)
-                    .header("x-amz-security-token", securityToken)
-                    .header("Authorization", authorizationHeader)
-                    .header("Content-Type", "image/jpeg")
-                    .build()
+                val response = if (isAliyunOss) {
+                    // AliCloud OSS direct upload with public-read ACL
+                    val gmtFormat = java.text.SimpleDateFormat("EEE, dd MMM yyyy HH:mm:ss 'GMT'", java.util.Locale.US).apply {
+                        timeZone = java.util.TimeZone.getTimeZone("GMT")
+                    }
+                    val dateGmt = gmtFormat.format(java.util.Date())
 
-                val response = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-                    okHttpClient.newCall(request).execute()
+                    val ossHeaders = "x-oss-object-acl:public-read\nx-oss-security-token:$securityToken\n"
+                    val resource = "/$bucket/$objectKey"
+                    val stringToSign = "PUT\n\nimage/jpeg\n$dateGmt\n$ossHeaders$resource"
+
+                    val mac = javax.crypto.Mac.getInstance("HmacSHA1")
+                    mac.init(javax.crypto.spec.SecretKeySpec(accessKeySecret.toByteArray(Charsets.UTF_8), "HmacSHA1"))
+                    val sigBytes = mac.doFinal(stringToSign.toByteArray(Charsets.UTF_8))
+                    val signature = android.util.Base64.encodeToString(sigBytes, android.util.Base64.NO_WRAP)
+                    val ossAuth = "OSS $accessKeyId:$signature"
+
+                    val ossReq = okhttp3.Request.Builder()
+                        .url(publicUrl)
+                        .put(requestBody)
+                        .header("Host", host)
+                        .header("Date", dateGmt)
+                        .header("Content-Type", "image/jpeg")
+                        .header("x-oss-object-acl", "public-read")
+                        .header("x-oss-security-token", securityToken)
+                        .header("Authorization", ossAuth)
+                        .build()
+
+                    kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                        okHttpClient.newCall(ossReq).execute()
+                    }
+                } else {
+                    // AWS S3 V4 signing fallback
+                    val sdfAmz = java.text.SimpleDateFormat("yyyyMMdd'T'HHmmss'Z'", java.util.Locale.US).apply { timeZone = java.util.TimeZone.getTimeZone("UTC") }
+                    val sdfDate = java.text.SimpleDateFormat("yyyyMMdd", java.util.Locale.US).apply { timeZone = java.util.TimeZone.getTimeZone("UTC") }
+                    val now = java.util.Date()
+                    val amzDate = sdfAmz.format(now)
+                    val dateStamp = sdfDate.format(now)
+
+                    val md256 = java.security.MessageDigest.getInstance("SHA-256")
+                    val payloadHash = md256.digest(imageBytes).joinToString("") { "%02x".format(it) }
+
+                    val canonicalUri = "/$objectKey"
+                    val canonicalQuerystring = ""
+                    val canonicalHeaders = "host:$host\nx-amz-content-sha256:$payloadHash\nx-amz-date:$amzDate\nx-amz-security-token:$securityToken\n"
+                    val signedHeaders = "host;x-amz-content-sha256;x-amz-date;x-amz-security-token"
+                    val canonicalRequest = "PUT\n$canonicalUri\n$canonicalQuerystring\n$canonicalHeaders\n$signedHeaders\n$payloadHash"
+
+                    val credentialScope = "$dateStamp/$region/s3/aws4_request"
+                    val stringToSign = "AWS4-HMAC-SHA256\n$amzDate\n$credentialScope\n${md256.digest(canonicalRequest.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }}"
+
+                    fun hmacSha256(key: ByteArray, message: String): ByteArray {
+                        val mac = javax.crypto.Mac.getInstance("HmacSHA256")
+                        mac.init(javax.crypto.spec.SecretKeySpec(key, "HmacSHA256"))
+                        return mac.doFinal(message.toByteArray(Charsets.UTF_8))
+                    }
+
+                    val kDate = hmacSha256(("AWS4$accessKeySecret").toByteArray(Charsets.UTF_8), dateStamp)
+                    val kRegion = hmacSha256(kDate, region)
+                    val kService = hmacSha256(kRegion, "s3")
+                    val kSigning = hmacSha256(kService, "aws4_request")
+                    val signatureBytes = hmacSha256(kSigning, stringToSign)
+                    val signature = signatureBytes.joinToString("") { "%02x".format(it) }
+
+                    val authorizationHeader = "AWS4-HMAC-SHA256 Credential=$accessKeyId/$credentialScope, SignedHeaders=$signedHeaders, Signature=$signature"
+
+                    val s3Req = okhttp3.Request.Builder()
+                        .url(publicUrl)
+                        .put(requestBody)
+                        .header("Host", host)
+                        .header("x-amz-date", amzDate)
+                        .header("x-amz-content-sha256", payloadHash)
+                        .header("x-amz-security-token", securityToken)
+                        .header("Authorization", authorizationHeader)
+                        .header("Content-Type", "image/jpeg")
+                        .build()
+
+                    kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                        okHttpClient.newCall(s3Req).execute()
+                    }
                 }
 
                 if (response.isSuccessful) {
-                    // 6. Update user profile on official server
-                    val modifyRes = api.modifyProfile(mapOf("nickname" to nickname, "avatar" to putUrl))
+                    // Update user profile on official server with the public avatar URL
+                    val modifyRes = api.modifyProfile(mapOf("nickname" to nickname, "avatar" to publicUrl))
                     if (modifyRes.code == 0 || modifyRes.message == "ok") {
-                        currentUserProfile = currentUserProfile?.copy(avatar = putUrl)
-                        checkUserSession()
+                        // Immediately update local UI state so avatar appears with 0ms delay
+                        currentUserProfile = currentUserProfile?.copy(avatar = publicUrl, nickname = nickname)
+                        
+                        // Clear Coil cache for old avatar so new image renders instantly
+                        try {
+                            val app = getApplication<Application>()
+                            coil.Coil.imageLoader(app).memoryCache?.clear()
+                        } catch (_: Exception) {}
+
+                        // Background sync with server profile without blocking or resetting state
+                        viewModelScope.launch {
+                            try {
+                                val refreshRes = api.getUserInfo()
+                                if (refreshRes.logged_in && refreshRes.user != null) {
+                                    // Preserve new avatar if server has cache lag
+                                    val syncedAvatar = if (refreshRes.user.avatar.isNotEmpty()) refreshRes.user.avatar else publicUrl
+                                    currentUserProfile = refreshRes.user.copy(avatar = syncedAvatar)
+                                }
+                            } catch (_: Exception) {}
+                        }
+
                         onSuccess()
                     } else {
                         onError(modifyRes.message.ifEmpty { "Failed to update profile" })
@@ -671,7 +782,7 @@ class MovieViewModel(application: Application) : AndroidViewModel(application) {
                 } else {
                     val errorBody = response.body?.string()
                     val errorDetail = if (errorBody.isNullOrEmpty()) response.message else errorBody
-                    onError("Upload to Amazon S3 failed: HTTP ${response.code} $errorDetail")
+                    onError("Upload failed: HTTP ${response.code} $errorDetail")
                 }
             } catch (e: Exception) {
                 onError(parseErrorMessage(e))
@@ -792,60 +903,26 @@ class MovieViewModel(application: Application) : AndroidViewModel(application) {
         isDashboardLoading = true
         viewModelScope.launch {
             try {
-                val trending = repository.getTrending(1, 20)
-                _trendingMovies.value = trending
-                val categories = repository.getCategoryList(selectedCategoryTab, 1, 30)
-                categoryCache[selectedCategoryTab] = categories
-                _categoryMovies.value = categories
-                
-                // Pre-fetch details and warm up poster image cache for instant rendering
-                val app = getApplication<Application>()
-                val imgLoader = coil.Coil.imageLoader(app)
-                trending.take(20).forEach { item ->
-                    launch { repository.getDetail(item.id) }
-                    if (item.poster.isNotEmpty()) {
-                        launch(Dispatchers.IO) {
-                            val request = coil.request.ImageRequest.Builder(app)
-                                .data(item.poster)
-                                .memoryCacheKey(item.poster)
-                                .diskCacheKey(item.poster)
-                                .build()
-                            imgLoader.enqueue(request)
-                        }
-                    }
-                }
-                categories.take(24).forEach { item ->
-                    launch { repository.getDetail(item.id) }
-                    if (item.poster.isNotEmpty()) {
-                        launch(Dispatchers.IO) {
-                            val request = coil.request.ImageRequest.Builder(app)
-                                .data(item.poster)
-                                .memoryCacheKey(item.poster)
-                                .diskCacheKey(item.poster)
-                                .build()
-                            imgLoader.enqueue(request)
-                        }
-                    }
+                // Fetch trending and categories in parallel using coroutineScope
+                val (trending, categories) = coroutineScope {
+                    val trendingDeferred = async(Dispatchers.IO) { repository.getTrending(1, 20) }
+                    val categoriesDeferred = async(Dispatchers.IO) { repository.getCategoryList(selectedCategoryTab, 1, 30) }
+                    Pair(trendingDeferred.await(), categoriesDeferred.await())
                 }
 
-                // Pre-fetch other categories in the background for instant switching
-                _activeCategories.value.filter { it.first != selectedCategoryTab }.forEach { cat ->
-                    launch {
+                _trendingMovies.value = trending
+                categoryCache[selectedCategoryTab] = categories
+                _categoryMovies.value = categories
+
+                // Prioritize visible poster loading - let Compose handle UI cards directly without network congestion
+                // Background category prefetch is delayed by 3 seconds so visible screen posters load at 100% bandwidth
+                launch {
+                    kotlinx.coroutines.delay(3000)
+                    _activeCategories.value.filter { it.first != selectedCategoryTab }.forEach { cat ->
                         try {
                             val catData = repository.getCategoryList(cat.first, 1, 30)
                             categoryCache[cat.first] = catData
-                            // Pre-load top posters for upcoming tabs
-                            catData.take(8).forEach { catItem ->
-                                if (catItem.poster.isNotEmpty()) {
-                                    val req = coil.request.ImageRequest.Builder(getApplication<Application>())
-                                        .data(catItem.poster)
-                                        .build()
-                                    coil.Coil.imageLoader(getApplication<Application>()).enqueue(req)
-                                }
-                            }
-                        } catch (e: Exception) {
-                            android.util.Log.e("MovieViewModel", "Prefetch failed for category ${cat.first}", e)
-                        }
+                        } catch (_: Exception) {}
                     }
                 }
             } catch (e: Exception) {
@@ -881,6 +958,8 @@ class MovieViewModel(application: Application) : AndroidViewModel(application) {
                                 .data(item.poster)
                                 .memoryCacheKey(item.poster)
                                 .diskCacheKey(item.poster)
+                                .size(width = 330, height = 480)
+                                .precision(coil.size.Precision.INEXACT)
                                 .build()
                             imgLoader.enqueue(request)
                         }
@@ -977,7 +1056,23 @@ class MovieViewModel(application: Application) : AndroidViewModel(application) {
         
         viewModelScope.launch {
             try {
-                detailRecommendations = repository.getDetailRec(subject.id)
+                val recs = repository.getDetailRec(subject.id)
+                detailRecommendations = recs
+                // Warm up recommendation poster images immediately like Vega
+                val app = getApplication<Application>()
+                val imgLoader = coil.Coil.imageLoader(app)
+                recs.take(10).forEach { recMovie ->
+                    if (recMovie.poster.isNotEmpty()) {
+                        val req = coil.request.ImageRequest.Builder(app)
+                            .data(recMovie.poster)
+                            .memoryCacheKey(recMovie.poster)
+                            .diskCacheKey(recMovie.poster)
+                            .size(width = 330, height = 480)
+                            .precision(coil.size.Precision.INEXACT)
+                            .build()
+                        imgLoader.enqueue(req)
+                    }
+                }
             } catch (e: Exception) {
                 // Ignore failure for recommendations
             }
@@ -1051,6 +1146,45 @@ class MovieViewModel(application: Application) : AndroidViewModel(application) {
                 android.util.Log.e("MovieViewModel", "Failed to fetch episode play info", e)
             } finally {
                 isPlaybackLoading = false
+            }
+        }
+    }
+
+    fun downloadEpisodesBatch(
+        context: android.content.Context,
+        episodes: List<com.example.data.model.Episode>,
+        onProgressUpdate: ((Int, Int) -> Unit)? = null
+    ) {
+        val subject = selectedSubject ?: return
+        if (episodes.isEmpty()) return
+
+        Toast.makeText(context, "Download started...", Toast.LENGTH_SHORT).show()
+        viewModelScope.launch(Dispatchers.IO) {
+            val resId = selectedResource?.resourceId
+            var queuedCount = 0
+            for (ep in episodes) {
+                try {
+                    val playInfoResult = repository.getPlayInfo(
+                        subject.id,
+                        ep.seasonNumber,
+                        ep.episodeNumber,
+                        resourceId = resId
+                    )
+                    val stream = playInfoResult.streamList.firstOrNull()
+                    val streamUrl = stream?.url ?: ""
+                    if (streamUrl.isNotEmpty() && !streamUrl.contains("b164fbfb4347792950bdfbfb563d39d9.mp4")) {
+                        val safeTitle = "${subject.name} S${ep.seasonNumber}E${ep.episodeNumber.toString().padStart(2, '0')}"
+                        withContext(Dispatchers.Main) {
+                            com.example.ui.screens.downloadVideo(context, streamUrl, safeTitle, subject.poster, showToast = false)
+                        }
+                        queuedCount++
+                        withContext(Dispatchers.Main) {
+                            onProgressUpdate?.invoke(queuedCount, episodes.size)
+                        }
+                    }
+                } catch (e: Exception) {
+                    android.util.Log.e("MovieViewModel", "Batch download failed for ep: ${ep.episodeNumber}", e)
+                }
             }
         }
     }

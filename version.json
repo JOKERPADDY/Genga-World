@@ -1,7 +1,7 @@
 {
-  "versionName": "2.5",
-  "versionCode": 3,
+  "versionName": "3.0",
+  "versionCode": 4,
   "forceUpdate": false,
-  "changelog": "• Improved video buffering & playback performance\n• Fixed Download player issue",
-  "downloadUrl": "https://github.com/solo12345689/Genga-World/releases/download/v2.5/GengaWorld.apk"
+  "changelog": "• Added multiple video download option\n• Improved download function",
+  "downloadUrl": "https://github.com/solo12345689/Genga-World/releases/download/v3.0/GengaWorld.apk"
 }

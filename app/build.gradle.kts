@@ -1,4 +1,7 @@
 import com.google.gms.googleservices.GoogleServicesPlugin.MissingGoogleServicesStrategy
+import java.util.Properties
+import java.io.FileInputStream
+import java.io.File
 
 plugins {
   alias(libs.plugins.android.application)
@@ -16,18 +19,26 @@ android {
     applicationId = "com.gengaworld.app"
     minSdk = 24
     targetSdk = 36
-    versionCode = 3
-    versionName = "2.5"
+    versionCode = 4
+    versionName = "3.0"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }
 
+  val keystorePropertiesFile = rootProject.file("key.properties")
+  val keystoreProperties = Properties()
+  if (keystorePropertiesFile.exists()) {
+    keystoreProperties.load(FileInputStream(keystorePropertiesFile))
+  }
+
   signingConfigs {
     create("release") {
-      storeFile = file("release-key.jks")
-      storePassword = "sarthakhasija30#2010"
-      keyAlias = "release"
-      keyPassword = "sarthakhasija30#2010"
+      val keyStorePath = keystoreProperties.getProperty("storeFile") ?: "release-key.jks"
+      val resolvedFile = File(keyStorePath)
+      storeFile = if (resolvedFile.isAbsolute) resolvedFile else file(keyStorePath)
+      storePassword = keystoreProperties.getProperty("storePassword")
+      keyAlias = keystoreProperties.getProperty("keyAlias")
+      keyPassword = keystoreProperties.getProperty("keyPassword")
     }
     create("debugConfig") {
       storeFile = file("${rootDir}/debug.keystore")
